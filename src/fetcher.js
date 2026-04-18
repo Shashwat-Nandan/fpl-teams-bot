@@ -19,7 +19,8 @@ class Fetcher {
     this.timeoutMs = opts.timeoutMs ?? 30000;
     this.userAgent =
       opts.userAgent ??
-      'myFPLMiniLeague-crawler/1.0 (+https://myfplminileague.com)';
+      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 ' +
+        '(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36';
     this.logger = opts.logger ?? null;
     this.lastRequestAt = 0;
   }
@@ -41,6 +42,7 @@ class Fetcher {
   async fetchJson(url) {
     let attempt = 0;
     let lastError;
+    let lastStatus;
 
     while (attempt <= this.maxRetries) {
       await this._throttle();
@@ -52,7 +54,9 @@ class Fetcher {
         const res = await fetch(url, {
           headers: {
             'User-Agent': this.userAgent,
-            Accept: 'application/json',
+            Accept: 'application/json, text/plain, */*',
+            'Accept-Language': 'en-US,en;q=0.9',
+            Referer: 'https://fantasy.premierleague.com/',
           },
           signal: controller.signal,
         });
@@ -63,6 +67,7 @@ class Fetcher {
         }
 
         if (res.status === 429) {
+          lastStatus = 429;
           const retryAfterHeader = res.headers.get('retry-after');
           const retryAfterSec = parseInt(retryAfterHeader || '0', 10);
           const wait =
@@ -76,6 +81,7 @@ class Fetcher {
         }
 
         if (res.status >= 500 && res.status < 600) {
+          lastStatus = res.status;
           const wait = this._backoffMs(attempt);
           this.logger?.warn(
             `HTTP ${res.status} on ${url}. Retrying in ${wait}ms (attempt ${attempt + 1})`
@@ -108,11 +114,10 @@ class Fetcher {
       }
     }
 
-    const msg = `Max retries (${this.maxRetries}) exceeded for ${url}`;
-    const err = new Error(
-      lastError ? `${msg}. Last error: ${lastError.message}` : msg
-    );
-    throw err;
+    const parts = [`Max retries (${this.maxRetries}) exceeded for ${url}`];
+    if (lastStatus) parts.push(`last status: ${lastStatus}`);
+    if (lastError) parts.push(`last error: ${lastError.message}`);
+    throw new Error(parts.join('. '));
   }
 }
 
