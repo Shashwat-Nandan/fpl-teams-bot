@@ -27,6 +27,10 @@ npm run stats
 # Full crawl — run in background, will take many hours
 node src/index.js > /dev/null 2>&1 &
 
+# Backfill managers missed during the crawl (rank shifts mid-scan).
+# See "Backfilling missed managers" below.
+node src/backfill.js > /dev/null 2>&1 &
+
 # Export to CSV for Supabase / Postgres import
 npm run export
 ```
@@ -61,6 +65,44 @@ Progress is checkpointed to SQLite after every successful page. Kill with Ctrl+C
 
 State is keyed by `league_id`, so if you switch leagues (`--league 323` for Second Chance, for example) the state for that league is tracked separately.
 
+## Backfilling missed managers
+
+The league crawler scans pages of standings sorted by rank. When ranks shift mid-crawl (e.g. across a gameweek, or during a multi-day pause), managers whose rank improves into already-crawled pages get silently skipped. On a multi-day full run this can leave **~1–2% of active managers missing** from the DB.
+
+`src/backfill.js` fixes this by probing entry IDs directly via `/api/entry/{id}/`. Entry IDs are immutable, so this side-steps the moving-target problem entirely:
+
+- 200 → upsert `{id, player_first_name + player_last_name, name, summary_overall_rank}` into `managers`.
+- 404 → record in `dead_entries` so re-runs skip it.
+
+```bash
+# Smoke test: probe 5 missing IDs.
+npm run backfill-test
+
+# Full backfill (run in background — typically a few days for ~360k gaps).
+node src/backfill.js > /dev/null 2>&1 &
+
+# Tail progress.
+tail -f logs/backfill.log
+```
+
+The backfill is resumable: the gap set is recomputed from the DB on each run (`[1, max(entry_id)] − managers − dead_entries`). Killing the process at any point loses at most one in-flight request.
+
+CLI options mirror the crawler's where they overlap:
+
+```
+--upper-bound <n>     Highest entry_id to probe (default: max(entry_id) in DB)
+--max-ids <n>         Max IDs to probe in this run (default: unlimited)
+--delay-ms <n>        Min delay between requests in ms (default: 1000)
+--jitter-ms <n>       Max additional random jitter in ms (default: 500)
+--max-retries <n>     Max retries per request (default: 5)
+--db <path>           SQLite DB path (default: ./data/fpl.db)
+--log <path>          Log file path (default: ./logs/backfill.log)
+--no-log-file         Log to stdout only
+--user-agent <s>      Override User-Agent header
+```
+
+Default delay is 1000ms (vs 1500ms for the crawler) since per-entry calls are lighter — bump `--delay-ms` if you see sustained 429s.
+
 ## CLI options
 
 ```
@@ -88,6 +130,14 @@ CREATE TABLE managers (
 );
 CREATE INDEX idx_player_name ON managers(player_name COLLATE NOCASE);
 CREATE INDEX idx_team_name   ON managers(team_name   COLLATE NOCASE);
+
+-- Used by the backfiller to remember entry_ids that returned 404, so we
+-- don't re-probe them on subsequent runs.
+CREATE TABLE dead_entries (
+  entry_id   INTEGER PRIMARY KEY,
+  status     INTEGER NOT NULL,
+  last_seen  INTEGER NOT NULL
+);
 ```
 
 Conflicts on `entry_id` are UPSERTed, so re-crawls refresh names/ranks for existing managers.
@@ -143,8 +193,10 @@ screen -dmS fpl-crawler bash -c 'cd /opt/fpl-crawler && node src/index.js'
 
 ```
 src/
-  index.js      CLI entry point
-  crawler.js    Crawl loop + checkpointing
+  index.js      Crawler CLI entry point
+  crawler.js    League-pages crawl loop + checkpointing
+  backfill.js   Backfiller CLI entry point
+  backfiller.js Probes /api/entry/{id}/ for IDs missed by the crawler
   fetcher.js    HTTP with rate limit + retries
   db.js         SQLite schema + prepared statements
   logger.js     Timestamped logger

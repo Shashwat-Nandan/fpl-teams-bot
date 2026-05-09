@@ -9,6 +9,8 @@
   "scripts": {
     "start": "node src/index.js",
     "test-run": "node src/index.js --max-pages 3",
+    "backfill": "node src/backfill.js",
+    "backfill-test": "node src/backfill.js --max-ids 5",
     "export": "node src/export.js",
     "stats": "node src/stats.js"
   },
