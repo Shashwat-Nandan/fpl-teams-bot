@@ -29,20 +29,48 @@ function createFakeBetterSqlite3() {
   const stores = new Map();
   function getStore(dbPath) {
     if (!stores.has(dbPath)) {
-      stores.set(dbPath, { managers: new Map(), state: new Map() });
+      stores.set(dbPath, { managers: new Map(), state: new Map(), dead: new Map() });
     }
     return stores.get(dbPath);
   }
   return function FakeDatabase(dbPath) {
-    const { managers, state } = getStore(dbPath);
+    const { managers, state, dead } = getStore(dbPath);
 
     const prepare = (sql) => {
       const s = sql.trim();
       if (s.startsWith('INSERT INTO managers')) {
         return {
+          // Mirrors the real UPSERT: rank always refreshes, but last_updated
+          // only moves when player_name or team_name actually changed, since
+          // that column is what drives incremental exports.
           run: (entry_id, player_name, team_name, rank, last_updated) => {
-            managers.set(entry_id, { entry_id, player_name, team_name, rank, last_updated });
+            const prev = managers.get(entry_id);
+            const contentChanged =
+              !prev ||
+              prev.player_name !== player_name ||
+              prev.team_name !== team_name;
+            managers.set(entry_id, {
+              entry_id,
+              player_name,
+              team_name,
+              rank,
+              last_updated: contentChanged ? last_updated : prev.last_updated,
+            });
           },
+        };
+      }
+      if (s.startsWith('INSERT INTO dead_entries')) {
+        return {
+          run: (entry_id, status, last_seen) => {
+            dead.set(entry_id, { entry_id, status, last_seen });
+          },
+        };
+      }
+      if (s.startsWith('SELECT MAX(entry_id)')) {
+        return {
+          get: () => ({
+            max: managers.size ? Math.max(...managers.keys()) : null,
+          }),
         };
       }
       if (s.startsWith('SELECT value FROM crawl_state')) {
@@ -79,6 +107,7 @@ function createFakeBetterSqlite3() {
       // expose internals for test assertions
       _managers: managers,
       _state: state,
+      _dead: dead,
     };
   };
 }

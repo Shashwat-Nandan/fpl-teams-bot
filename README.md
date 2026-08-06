@@ -31,7 +31,7 @@ node src/index.js > /dev/null 2>&1 &
 # See "Backfilling missed managers" below.
 node src/backfill.js > /dev/null 2>&1 &
 
-# Export to CSV for Supabase / Postgres import
+# Export to Parquet — full the first time, incremental every time after
 npm run export
 ```
 
@@ -118,6 +118,24 @@ Default delay is 1000ms (vs 1500ms for the crawler) since per-entry calls are li
 --user-agent <s>      Override User-Agent header
 ```
 
+Exporter (`src/export.js`):
+
+```
+--out-dir <path>       Output directory (default: ./data/parquet)
+--db <path>            SQLite DB path (default: ./data/fpl.db)
+--full                 Force a full re-export and re-baseline the watermark
+--delta                Force an incremental export
+--since <ts>           Override the watermark (unix seconds or ISO-8601)
+--rows-per-file <n>    Rows per parquet part file (default: 2000000)
+--compression <c>      GZIP | SNAPPY | UNCOMPRESSED (default: GZIP)
+--overlap-seconds <n>  Watermark rewind for safe overlap (default: 1)
+--dry-run              Report what would be exported; write nothing
+--status               Print watermark + recent export history, then exit
+--dataset <name>       Watermark key, to feed several targets independently
+--log <path>           Log file path (default: ./logs/export.log)
+--no-log-file          Log to stdout only
+```
+
 ## Data model
 
 ```sql
@@ -126,10 +144,11 @@ CREATE TABLE managers (
   player_name   TEXT NOT NULL,
   team_name     TEXT NOT NULL,
   rank          INTEGER,
-  last_updated  INTEGER NOT NULL    -- unix seconds
+  last_updated  INTEGER NOT NULL    -- unix seconds; only moves on a *content* change
 );
 CREATE INDEX idx_player_name ON managers(player_name COLLATE NOCASE);
 CREATE INDEX idx_team_name   ON managers(team_name   COLLATE NOCASE);
+CREATE INDEX idx_last_updated ON managers(last_updated);   -- built on first export
 
 -- Used by the backfiller to remember entry_ids that returned 404, so we
 -- don't re-probe them on subsequent runs.
@@ -138,33 +157,142 @@ CREATE TABLE dead_entries (
   status     INTEGER NOT NULL,
   last_seen  INTEGER NOT NULL
 );
+
+-- Incremental export watermark (one row per dataset) + run history.
+CREATE TABLE export_state (
+  dataset     TEXT PRIMARY KEY,
+  watermark   INTEGER NOT NULL,
+  last_kind   TEXT NOT NULL,
+  last_run_at INTEGER NOT NULL
+);
+CREATE TABLE export_runs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, dataset TEXT NOT NULL, kind TEXT NOT NULL,
+  watermark_from INTEGER NOT NULL, watermark_to INTEGER NOT NULL,
+  rows INTEGER NOT NULL, files TEXT NOT NULL,
+  started_at INTEGER NOT NULL, finished_at INTEGER NOT NULL
+);
 ```
 
 Conflicts on `entry_id` are UPSERTed, so re-crawls refresh names/ranks for existing managers.
 
-## Importing to Supabase / Postgres
+**`last_updated` is a change marker, not a "last seen" timestamp.** A re-crawl that finds a manager unchanged leaves it alone, and a **rank-only** change refreshes `rank` but deliberately does *not* bump `last_updated`. Ranks churn for nearly every one of the ~12.7M managers after each gameweek, so if rank counted as a change, every "incremental" export would be a full one. Only `player_name` / `team_name` changes — the fields the search actually uses — mark a row dirty.
+
+## Exporting to Parquet (full, then incremental)
 
 ```bash
-npm run export   # writes ./data/fpl_managers.csv
+npm run export          # first run: FULL snapshot; every run after: delta only
+npm run export-status   # where the watermark sits + recent run history
+npm run export-dry-run  # what the next run would do, writes nothing
+npm run export-full     # force a re-baseline
 ```
 
-Then in Postgres:
+Output under `./data/parquet`:
+
+```
+data/parquet/
+  managers_full_20260806T091600Z/
+    part-0000.parquet          # 2M rows each by default (--rows-per-file)
+    part-0001.parquet
+    ...
+  managers_delta_20260807T020000Z.parquet    # only what changed
+  managers_delta_20260808T020000Z.parquet
+```
+
+A full pass is always split into part files; a delta is a single file unless it outgrows `--rows-per-file`, in which case it becomes a part directory too.
+
+Rows are emitted in `last_updated` order, **not** sorted by `entry_id`. Sorting would force SQLite to materialise the whole range in a temp B-tree before the first row came out (a ~70s stall and a multi-GB temp file on a full pass); unordered, it streams straight off the index. Consumers UPSERT on `entry_id`, so order doesn't matter to them.
+
+Parquet schema:
+
+| column         | parquet type      | notes                          |
+| -------------- | ----------------- | ------------------------------ |
+| `entry_id`     | `INT32`           | FPL team ID, the primary key   |
+| `player_name`  | `UTF8`            |                                |
+| `team_name`    | `UTF8`            |                                |
+| `rank`         | `INT32` (nullable)| overall rank at export time    |
+| `last_updated` | `TIMESTAMP_MILLIS`| when the row's content changed |
+
+### Compression
+
+Parquet compression is a **per-column** property — passing a codec to the writer's options is silently ignored, so `src/parquet.js` bakes it into the schema. Head-to-head on 300k real rows from this dataset:
+
+| codec           | size/row | write rate |
+| --------------- | -------- | ---------- |
+| `UNCOMPRESSED`  | 49.5 B   | 62k rows/s |
+| `SNAPPY`        | 38.4 B   | 55k rows/s |
+| `GZIP` (default)| 26.2 B   | 52k rows/s |
+
+`GZIP` is the default because these files exist to be shipped and imported once; switch to `--compression SNAPPY` if you query the parquet in place and want faster decompression.
+
+### Measured full pass
+
+An actual `--full` run over the real 12.7M-row table:
+
+```
+full export complete: 12,741,486 rows in 7 file(s), 243.6 MB, 416s
+  part-0000.parquet   2,000,000 rows   38.8 MB
+  ...
+  part-0006.parquet     741,486 rows   13.9 MB
+```
+
+~30.5k rows/s, **243.6 MB vs the old CSV's 536 MB** (compression improves over the sample benchmark because full 2M-row parts give the encoder much more to work with). A delta run over the same table finishes in about a second.
+
+### How incremental works
+
+The watermark lives in SQLite (`export_state.watermark`), not on disk, so the parquet directory can be moved or cleared without losing your place. Each run:
+
+1. opens a **read transaction**, so the watermark read and the row scan share one consistent snapshot even while the crawler is writing;
+2. takes `hi = MAX(last_updated)`, clamped to `now - 1` so the second still in progress is never exported half-finished;
+3. exports rows in `(lo, hi]`;
+4. advances the watermark to `hi` — only after every file is closed.
+
+If a run crashes or is killed, partial parquet files are deleted and the watermark stays put, so the next run cleanly redoes the same range.
+
+**Deltas are at-least-once.** `last_updated` only has 1-second resolution and the crawler stamps its timestamp at the start of a transaction rather than at commit, so the lower bound is rewound by `--overlap-seconds` (default 1) to guarantee nothing is skipped. The cost is that the boundary second's rows can be re-emitted. Apply deltas downstream as an **UPSERT on `entry_id`**, never a blind INSERT. Set `--overlap-seconds 0` if nothing is writing concurrently.
+
+The first export builds `idx_last_updated` over the whole `managers` table (a one-time cost paid by the exporter, not the crawler — crawler startup is never blocked by it).
+
+## Importing to Supabase / Postgres
 
 ```sql
 CREATE TABLE fpl_managers (
-  entry_id    INTEGER PRIMARY KEY,
-  player_name TEXT NOT NULL,
-  team_name   TEXT NOT NULL,
-  rank        INTEGER
+  entry_id     INTEGER PRIMARY KEY,
+  player_name  TEXT NOT NULL,
+  team_name    TEXT NOT NULL,
+  rank         INTEGER,
+  last_updated TIMESTAMPTZ NOT NULL
 );
-
-\COPY fpl_managers FROM 'fpl_managers.csv' WITH (FORMAT csv, HEADER true);
 
 -- Trigram indexes for fuzzy name search
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
 CREATE INDEX idx_fpl_player_trgm ON fpl_managers USING gin (player_name gin_trgm_ops);
 CREATE INDEX idx_fpl_team_trgm   ON fpl_managers USING gin (team_name   gin_trgm_ops);
 ```
+
+Load the parquet files with whatever your stack prefers. With DuckDB (no server needed, reads the whole directory at once):
+
+```sql
+INSTALL postgres; LOAD postgres;
+ATTACH 'postgresql://…' AS pg (TYPE postgres);
+
+-- Initial load from the full snapshot.
+INSERT INTO pg.fpl_managers
+SELECT * FROM read_parquet('data/parquet/managers_full_*/part-*.parquet');
+```
+
+Then replay each delta idempotently:
+
+```sql
+INSERT INTO pg.fpl_managers
+SELECT * FROM read_parquet('data/parquet/managers_delta_20260807T020000Z.parquet')
+ON CONFLICT (entry_id) DO UPDATE SET
+  player_name  = EXCLUDED.player_name,
+  team_name    = EXCLUDED.team_name,
+  rank         = EXCLUDED.rank,
+  last_updated = EXCLUDED.last_updated;
+```
+
+Because every row carries its own `last_updated`, deltas can be replayed in any order and re-applied safely.
 
 Search API query shape:
 
@@ -187,7 +315,13 @@ screen -dmS fpl-crawler bash -c 'cd /opt/fpl-crawler && node src/index.js'
 # strategy for incremental updates is to re-crawl the whole thing — the
 # UPSERT makes this cheap for existing rows)
 0 2 * * *  cd /opt/fpl-crawler && node src/index.js >> logs/cron.log 2>&1
+
+# ...then ship only what changed. The first run emits a full snapshot,
+# every run after that emits a delta.
+0 3 * * *  cd /opt/fpl-crawler && node src/export.js >> logs/cron.log 2>&1
 ```
+
+The exporter is safe to run while the crawler is still going — it reads from a consistent snapshot, and anything written after that snapshot is simply picked up by the next run.
 
 ## Files
 
@@ -200,6 +334,8 @@ src/
   fetcher.js    HTTP with rate limit + retries
   db.js         SQLite schema + prepared statements
   logger.js     Timestamped logger
-  export.js     CSV export utility
+  export.js     Parquet export CLI (full first, incremental after)
+  exporter.js   Watermark resolution + streaming export loop
+  parquet.js    Parquet schema + partitioned/rolling writer
   stats.js      Progress stats
 ```

@@ -44,10 +44,39 @@ class FPLDatabase {
         status     INTEGER NOT NULL,
         last_seen  INTEGER NOT NULL
       );
+
+      -- Watermark for incremental (delta) exports. One row per dataset.
+      CREATE TABLE IF NOT EXISTS export_state (
+        dataset     TEXT PRIMARY KEY,
+        watermark   INTEGER NOT NULL,   -- highest managers.last_updated exported
+        last_kind   TEXT NOT NULL,      -- 'full' | 'delta'
+        last_run_at INTEGER NOT NULL
+      );
+
+      -- Append-only history of export runs, for auditing / replay.
+      CREATE TABLE IF NOT EXISTS export_runs (
+        id             INTEGER PRIMARY KEY AUTOINCREMENT,
+        dataset        TEXT NOT NULL,
+        kind           TEXT NOT NULL,
+        watermark_from INTEGER NOT NULL,
+        watermark_to   INTEGER NOT NULL,
+        rows           INTEGER NOT NULL,
+        files          TEXT NOT NULL,   -- JSON array of {path, rows, bytes}
+        started_at     INTEGER NOT NULL,
+        finished_at    INTEGER NOT NULL
+      );
     `);
   }
 
   _prepareStatements() {
+    // `last_updated` is the watermark that drives incremental exports, so it
+    // must only move when the row's *content* actually changed. `rank` churns
+    // for nearly every manager after each gameweek, so a rank-only change
+    // refreshes the column but deliberately leaves `last_updated` alone —
+    // otherwise every delta export would degenerate into a full one.
+    //
+    // In SQLite's DO UPDATE, all right-hand sides are evaluated against the
+    // pre-update row, so `managers.player_name` below is the *old* value.
     this.upsertManagerStmt = this.db.prepare(`
       INSERT INTO managers (entry_id, player_name, team_name, rank, last_updated)
       VALUES (?, ?, ?, ?, ?)
@@ -55,7 +84,12 @@ class FPLDatabase {
         player_name  = excluded.player_name,
         team_name    = excluded.team_name,
         rank         = excluded.rank,
-        last_updated = excluded.last_updated
+        last_updated = CASE
+          WHEN managers.player_name IS NOT excluded.player_name
+            OR managers.team_name   IS NOT excluded.team_name
+          THEN excluded.last_updated
+          ELSE managers.last_updated
+        END
     `);
 
     this.getStateStmt = this.db.prepare(
@@ -170,6 +204,132 @@ class FPLDatabase {
       }
     });
     tx(entries);
+  }
+
+  // ---------------------------------------------------------------------
+  // Export support
+  //
+  // These statements are prepared lazily: only `src/export.js` needs them,
+  // and the crawler/backfiller shouldn't pay for parsing them at startup.
+  // ---------------------------------------------------------------------
+
+  _exportStmts() {
+    if (this._export) return this._export;
+    this._export = {
+      maxLastUpdated: this.db.prepare(
+        'SELECT MAX(last_updated) AS max FROM managers'
+      ),
+      countRange: this.db.prepare(
+        'SELECT COUNT(*) AS count FROM managers WHERE last_updated > ? AND last_updated <= ?'
+      ),
+      // Deliberately unordered. Adding `ORDER BY entry_id` makes SQLite
+      // materialise the whole range in a temp B-tree before yielding the
+      // first row ("USE TEMP B-TREE FOR ORDER BY") — on a full export that
+      // is a ~70s stall and a multi-GB temp file before a single byte of
+      // parquet is written. Unordered, it streams straight off
+      // idx_last_updated. Consumers UPSERT on entry_id, so order is
+      // irrelevant to them.
+      selectRange: this.db.prepare(`
+        SELECT entry_id, player_name, team_name, rank, last_updated
+        FROM managers
+        WHERE last_updated > ? AND last_updated <= ?
+      `),
+      getExportState: this.db.prepare(
+        'SELECT * FROM export_state WHERE dataset = ?'
+      ),
+      setExportState: this.db.prepare(`
+        INSERT INTO export_state (dataset, watermark, last_kind, last_run_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(dataset) DO UPDATE SET
+          watermark   = excluded.watermark,
+          last_kind   = excluded.last_kind,
+          last_run_at = excluded.last_run_at
+      `),
+      insertExportRun: this.db.prepare(`
+        INSERT INTO export_runs
+          (dataset, kind, watermark_from, watermark_to, rows, files, started_at, finished_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `),
+      recentRuns: this.db.prepare(
+        'SELECT * FROM export_runs WHERE dataset = ? ORDER BY id DESC LIMIT ?'
+      ),
+    };
+    return this._export;
+  }
+
+  /**
+   * Delta exports scan `WHERE last_updated > ? AND last_updated <= ?`, which
+   * is a full table scan without this index. Created on demand (the first
+   * export pays for it) so crawler startup is never blocked by an index build
+   * over millions of rows. Returns true if it actually built the index.
+   */
+  ensureLastUpdatedIndex() {
+    const existing = this.db
+      .prepare("SELECT 1 FROM sqlite_master WHERE type='index' AND name=?")
+      .get('idx_last_updated');
+    if (existing) return false;
+    this.db.exec(
+      'CREATE INDEX IF NOT EXISTS idx_last_updated ON managers(last_updated)'
+    );
+    return true;
+  }
+
+  /**
+   * Open a read transaction so that the watermark read and the row scan that
+   * follows it see one consistent snapshot. Without this, a row committed by
+   * a concurrently running crawler between the two could be skipped forever.
+   *
+   * The caller MUST fully drain (or close) any iterator before endRead().
+   */
+  beginRead() {
+    this.db.exec('BEGIN DEFERRED');
+  }
+
+  endRead() {
+    if (this.db.inTransaction) this.db.exec('COMMIT');
+  }
+
+  getMaxLastUpdated() {
+    return this._exportStmts().maxLastUpdated.get().max ?? 0;
+  }
+
+  countInRange(lo, hi) {
+    return this._exportStmts().countRange.get(lo, hi).count;
+  }
+
+  /** Streaming iterator over the managers changed in (lo, hi]. */
+  iterateRange(lo, hi) {
+    return this._exportStmts().selectRange.iterate(lo, hi);
+  }
+
+  getExportState(dataset) {
+    return this._exportStmts().getExportState.get(dataset) ?? null;
+  }
+
+  getRecentExportRuns(dataset, limit = 10) {
+    return this._exportStmts().recentRuns.all(dataset, limit);
+  }
+
+  /**
+   * Commit an export: append the run to history and advance the watermark,
+   * atomically, so a crash can never leave the watermark ahead of the data.
+   */
+  recordExport(run) {
+    const s = this._exportStmts();
+    const tx = this.db.transaction((r) => {
+      s.insertExportRun.run(
+        r.dataset,
+        r.kind,
+        r.watermarkFrom,
+        r.watermarkTo,
+        r.rows,
+        JSON.stringify(r.files),
+        r.startedAt,
+        r.finishedAt
+      );
+      s.setExportState.run(r.dataset, r.watermarkTo, r.kind, r.finishedAt);
+    });
+    tx(run);
   }
 
   getState(key) {

@@ -12,9 +12,14 @@
     "backfill": "node src/backfill.js",
     "backfill-test": "node src/backfill.js --max-ids 5",
     "export": "node src/export.js",
-    "stats": "node src/stats.js"
+    "export-full": "node src/export.js --full",
+    "export-status": "node src/export.js --status",
+    "export-dry-run": "node src/export.js --dry-run",
+    "stats": "node src/stats.js",
+    "test": "node test-smoke.js && node test-export.js"
   },
   "dependencies": {
+    "@dsnp/parquetjs": "^1.8.8",
     "better-sqlite3": "^11.3.0"
   },
   "engines": {
