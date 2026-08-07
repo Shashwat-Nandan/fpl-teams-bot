@@ -2,6 +2,7 @@
 'use strict';
 
 const path = require('path');
+const { defaultDbPath } = require('./season');
 const FPLDatabase = require('./db');
 const Fetcher = require('./fetcher');
 const Logger = require('./logger');
@@ -18,12 +19,13 @@ whose ranks shifted into already-crawled pages mid-crawl).
 Usage: node src/backfill.js [options]
 
 Options:
-  --upper-bound <n>     Highest entry_id to probe (default: max(entry_id) in DB)
+  --upper-bound <n>     Highest entry_id to probe (default: total_players from
+                        bootstrap-static, i.e. every registered team)
   --max-ids <n>         Max IDs to probe in this run (default: unlimited)
   --delay-ms <n>        Min delay between requests in ms (default: 1000)
   --jitter-ms <n>       Max additional random jitter in ms (default: 500)
   --max-retries <n>     Max retries per request (default: 5)
-  --db <path>           SQLite DB path (default: ./data/fpl.db)
+  --db <path>           SQLite DB path (default: ./data/fpl-<season>.db)
   --log <path>          Log file path (default: ./logs/backfill.log)
   --no-log-file         Log to stdout only
   --user-agent <s>      Override User-Agent header
@@ -47,7 +49,7 @@ function parseArgs(argv) {
     minDelayMs: 1000,
     maxJitterMs: 500,
     maxRetries: 5,
-    dbPath: path.join(process.cwd(), 'data', 'fpl.db'),
+    dbPath: defaultDbPath(),
     logFile: path.join(process.cwd(), 'logs', 'backfill.log'),
     userAgent: undefined,
   };

@@ -87,10 +87,30 @@ class Crawler {
       }
 
       const results = standings.results;
-      if (results.length > 0) {
-        this.db.upsertBatch(results);
-        entriesThisRun += results.length;
+
+      // An empty page is either past the end of the league or — before the
+      // first gameweek is scored — a league that has no standings at all yet.
+      // Either way there is nothing to record, and checkpointing it would
+      // make a later run resume past a page it never actually read.
+      if (results.length === 0) {
+        if (page === 1) {
+          this.logger.warn(
+            `League ${this.leagueId} returned no standings at all. Classic ` +
+              'league standings do not exist until the first gameweek has ' +
+              'been scored, so this is expected pre-season. Not ' +
+              'checkpointing — re-run once GW1 is scored. To collect ' +
+              'managers before then, sweep entry IDs with src/backfill.js.'
+          );
+        } else {
+          this.logger.info(
+            `Page ${page} is empty — end of league. Not checkpointing it.`
+          );
+        }
+        break;
       }
+
+      this.db.upsertBatch(results);
+      entriesThisRun += results.length;
 
       hasNext = !!standings.has_next;
       this.db.setState('last_completed_page', page);

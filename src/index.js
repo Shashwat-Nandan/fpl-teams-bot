@@ -2,6 +2,7 @@
 'use strict';
 
 const path = require('path');
+const { defaultDbPath } = require('./season');
 const FPLDatabase = require('./db');
 const Fetcher = require('./fetcher');
 const Logger = require('./logger');
@@ -23,7 +24,7 @@ Options:
   --delay-ms <n>        Min delay between requests in ms (default: 1500)
   --jitter-ms <n>       Max additional random jitter in ms (default: 500)
   --max-retries <n>     Max retries per request (default: 5)
-  --db <path>           SQLite DB path (default: ./data/fpl.db)
+  --db <path>           SQLite DB path (default: ./data/fpl-<season>.db)
   --log <path>          Log file path (default: ./logs/crawler.log)
   --no-log-file         Log to stdout only
   --user-agent <s>      Override User-Agent header
@@ -48,7 +49,7 @@ function parseArgs(argv) {
     minDelayMs: 1500,
     maxJitterMs: 500,
     maxRetries: 5,
-    dbPath: path.join(process.cwd(), 'data', 'fpl.db'),
+    dbPath: defaultDbPath(),
     logFile: path.join(process.cwd(), 'logs', 'crawler.log'),
     userAgent: undefined,
   };

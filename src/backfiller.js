@@ -1,6 +1,7 @@
 'use strict';
 
 const ENTRY_URL = (id) => `https://fantasy.premierleague.com/api/entry/${id}/`;
+const BOOTSTRAP_URL = 'https://fantasy.premierleague.com/api/bootstrap-static/';
 
 /**
  * Fills gaps left behind by the league crawler.
@@ -22,71 +23,126 @@ class Backfiller {
     this.upperBound = opts.upperBound ?? null;
     this.maxIds = opts.maxIds ?? Infinity;
     this.checkpointLogEvery = opts.checkpointLogEvery ?? 100;
+    this.batchSize = opts.batchSize ?? 5000;
     this.db = opts.db;
     this.fetcher = opts.fetcher;
     this.logger = opts.logger;
     this.stopRequested = false;
   }
 
+  /**
+   * How many entry IDs exist right now.
+   *
+   * `bootstrap-static.total_players` is the count of registered teams, and
+   * because FPL issues entry IDs densely from 1 each season it is also the
+   * highest live ID (verified pre-season 2026-27: IDs 1..3,171,844 all
+   * resolve, everything above 404s).
+   *
+   * This matters most before the first gameweek: league standings do not
+   * exist yet, so `MAX(entry_id)` on a fresh database is 0 and deriving the
+   * bound from the DB would make the backfiller a no-op exactly when it is
+   * the only way to enumerate managers. Registrations also keep climbing
+   * until the GW1 deadline, so re-running picks up a higher ceiling for free.
+   */
+  async _resolveUpperBound() {
+    if (this.upperBound) return this.upperBound;
+
+    try {
+      const boot = await this.fetcher.fetchJson(BOOTSTRAP_URL);
+      const total = boot?.total_players;
+      if (Number.isInteger(total) && total > 0) {
+        this.logger.info(
+          `Upper bound ${total.toLocaleString()} from bootstrap-static ` +
+            '(total_players).'
+        );
+        // A crawl may already have stored an ID above it; never go backwards.
+        return Math.max(total, this.db.getMaxEntryId() ?? 0);
+      }
+      this.logger.warn('bootstrap-static had no usable total_players.');
+    } catch (e) {
+      this.logger.warn(`Could not read bootstrap-static: ${e.message}`);
+    }
+
+    const fromDb = this.db.getMaxEntryId();
+    if (fromDb) {
+      this.logger.info(`Falling back to MAX(entry_id) = ${fromDb}.`);
+      return fromDb;
+    }
+    return null;
+  }
+
   async run() {
-    const upper = this.upperBound ?? this.db.getMaxEntryId();
+    const upper = await this._resolveUpperBound();
     if (!upper) {
-      this.logger.info('Empty managers table; nothing to backfill.');
+      this.logger.error(
+        'No upper bound: bootstrap-static was unreachable and the managers ' +
+          'table is empty. Pass --upper-bound <n> to sweep explicitly.'
+      );
       return { probed: 0, found: 0, dead: 0 };
     }
 
-    this.logger.info(`Computing missing entry IDs in [1, ${upper}]...`);
-    const t0 = Date.now();
-    const missing = this.db.getMissingEntryIds(upper);
+    const estimated = this.db.countMissingEntryIds(upper);
     this.logger.info(
-      `Found ${missing.length} missing entry IDs ` +
-        `(scan took ${((Date.now() - t0) / 1000).toFixed(1)}s).`
+      `Sweeping [1, ${upper.toLocaleString()}] — ` +
+        `~${estimated.toLocaleString()} IDs not yet stored.`
     );
-    if (missing.length === 0) return { probed: 0, found: 0, dead: 0 };
+    if (estimated === 0) return { probed: 0, found: 0, dead: 0 };
 
-    const limit = Math.min(missing.length, this.maxIds);
+    const limit = Math.min(estimated, this.maxIds);
     let probed = 0;
     let found = 0;
     let dead = 0;
     const startedAt = Date.now();
 
-    for (let i = 0; i < limit && !this.stopRequested; i++) {
-      const id = missing[i];
-      const url = ENTRY_URL(id);
+    let cursor = 0;
+    let batch = this.db.getMissingEntryIdsAfter(cursor, upper, this.batchSize);
 
-      let data;
-      try {
-        data = await this.fetcher.fetchJson(url);
-      } catch (e) {
-        if (e.status === 404) {
-          this.db.markDead(id, 404);
-          dead++;
-          probed++;
-          this._maybeLog(probed, found, dead, limit, startedAt);
-          continue;
-        }
-        if (e.status && e.status >= 400 && e.status < 500) {
-          this.logger.warn(
-            `entry ${id}: HTTP ${e.status} (marking dead, will skip on re-run)`
-          );
-          this.db.markDead(id, e.status);
-          dead++;
-          probed++;
-          this._maybeLog(probed, found, dead, limit, startedAt);
-          continue;
-        }
-        this.logger.error(`Fatal error on entry ${id}: ${e.message}`);
-        throw e;
-      }
+    while (batch.length > 0 && probed < limit && !this.stopRequested) {
+      for (const id of batch) {
+        if (this.stopRequested || probed >= limit) break;
+        const url = ENTRY_URL(id);
 
-      try {
-        this.db.upsertFromEntry(data);
-        found++;
-      } catch (e) {
-        this.logger.warn(`entry ${id}: upsert failed — ${e.message}`);
+        let data;
+        try {
+          data = await this.fetcher.fetchJson(url);
+        } catch (e) {
+          if (e.status === 404) {
+            this.db.markDead(id, 404);
+            dead++;
+            probed++;
+            this._maybeLog(probed, found, dead, limit, startedAt);
+            continue;
+          }
+          if (e.status && e.status >= 400 && e.status < 500) {
+            this.logger.warn(
+              `entry ${id}: HTTP ${e.status} (marking dead, will skip on re-run)`
+            );
+            this.db.markDead(id, e.status);
+            dead++;
+            probed++;
+            this._maybeLog(probed, found, dead, limit, startedAt);
+            continue;
+          }
+          this.logger.error(`Fatal error on entry ${id}: ${e.message}`);
+          throw e;
+        }
+
+        try {
+          this.db.upsertFromEntry(data);
+          found++;
+        } catch (e) {
+          this.logger.warn(`entry ${id}: upsert failed — ${e.message}`);
+        }
+        probed++;
+        this._maybeLog(probed, found, dead, limit, startedAt);
       }
-      probed++;
-      this._maybeLog(probed, found, dead, limit, startedAt);
+      // Every ID in the batch is now either stored or marked dead, so the
+      // next batch starts after the last one we looked at.
+      cursor = batch[batch.length - 1];
+      batch =
+        probed < limit && !this.stopRequested
+          ? this.db.getMissingEntryIdsAfter(cursor, upper, this.batchSize)
+          : [];
     }
 
     const duration = (Date.now() - startedAt) / 1000;

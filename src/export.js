@@ -27,6 +27,7 @@
 
 const path = require('path');
 const fs = require('fs');
+const { defaultDbPath } = require('./season');
 const FPLDatabase = require('./db');
 const Logger = require('./logger');
 const Exporter = require('./exporter');
@@ -45,7 +46,7 @@ Usage: node src/export.js [options]
 
 Options:
   --out-dir <path>       Output directory (default: ./data/parquet)
-  --db <path>            SQLite DB path (default: ./data/fpl.db)
+  --db <path>            SQLite DB path (default: ./data/fpl-<season>.db)
   --full                 Force a full re-export and re-baseline the watermark
   --delta                Force an incremental export (fails-safe to full if
                          no previous export exists)
@@ -119,7 +120,7 @@ function parseSince(v) {
 function parseArgs(argv) {
   const opts = {
     outDir: path.join(process.cwd(), 'data', 'parquet'),
-    dbPath: path.join(process.cwd(), 'data', 'fpl.db'),
+    dbPath: defaultDbPath(),
     mode: 'auto',
     since: null,
     rowsPerFile: 2_000_000,

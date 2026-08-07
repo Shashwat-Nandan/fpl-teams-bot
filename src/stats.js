@@ -7,12 +7,12 @@
  * Usage: node src/stats.js [db-path]
  */
 
-const path = require('path');
 const fs = require('fs');
+const { defaultDbPath } = require('./season');
 const FPLDatabase = require('./db');
 
 function main() {
-  const dbPath = process.argv[2] || path.join(process.cwd(), 'data', 'fpl.db');
+  const dbPath = process.argv[2] || defaultDbPath();
   if (!fs.existsSync(dbPath)) {
     console.error(`DB not found at ${dbPath}`);
     process.exit(1);

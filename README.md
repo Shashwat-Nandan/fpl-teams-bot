@@ -10,7 +10,47 @@ Plus `rank` (overall rank) for disambiguation in search results.
 
 ## Why this approach
 
-FPL has no public search endpoint. The Overall league `314` is the only practical source that lists every active manager, paginated 50 per page. Iterating pages is cheaper and more reliable than brute-forcing sequential `entry/{id}/` lookups (which would need ~11M requests vs. ~220k pages here).
+FPL has no public search endpoint. The Overall league `314` is the only practical source that lists every active manager, paginated 50 per page. Iterating pages is cheaper and more reliable than brute-forcing sequential `entry/{id}/` lookups (which would need ~13M requests vs. ~260k pages here).
+
+**Except before the first gameweek**, when league standings don't exist at all — see below.
+
+## Seasons
+
+Two facts drive everything here, both verified against the live API:
+
+1. **FPL reassigns entry IDs from 1 every season.** Entry `3027768` was "Erik Ibsen" in 2025-26; in 2026-27 it is "Philip Sander". IDs are dense from 1 to `bootstrap-static.total_players`, and everything above that 404s.
+2. **Classic-league standings do not exist until the first gameweek is scored.** Pre-season, `leagues-classic/314/standings/` returns `results: []` with `has_next: false`. (League `315` is "StarHub League", not Overall — Overall is always `314`.)
+
+Because of (1), **seasons cannot share a database**: re-crawling into last season's file would UPSERT one manager's row on top of another's, and every ID above the new season's ceiling would linger forever as a manager who no longer exists. Each season gets its own file, named from `SEASON` in `src/season.js`:
+
+```
+data/fpl.db            # 2025-26, archived — reachable with --db
+data/fpl-2026-27.db    # current season (the default for every command)
+```
+
+Bump `SEASON` once a year. Last season's file is untouched.
+
+### Collecting before the season starts
+
+Because of (2), the league crawler simply cannot run pre-season. It detects this and refuses to checkpoint:
+
+```
+[WARN] League 314 returned no standings at all. Classic league standings do not
+       exist until the first gameweek has been scored, so this is expected
+       pre-season. Not checkpointing — re-run once GW1 is scored.
+```
+
+That guard matters: without it the crawler recorded `last_completed_page = 1` against an empty league and the real post-GW1 crawl would resume at page 2, permanently skipping the top 50 managers.
+
+The entry endpoint **does** work pre-season, so `src/backfill.js` is the only way to collect managers before GW1. It takes its ceiling from `bootstrap-static.total_players` (no longer from `MAX(entry_id)`, which is 0 on a fresh DB), so it sweeps `1..N` on an empty database and picks up a higher ceiling every re-run as registrations climb:
+
+```bash
+node src/backfill.js > /dev/null 2>&1 &
+```
+
+Be realistic about the arithmetic: at the default ~1.25 s/request, 3.2M registered teams is **~46 days**, and registrations keep growing until the GW1 deadline (2025-26 finished with 13.08M IDs issued, and the count was climbing ~60k/day in early August). A pre-season sweep produces a large but **incomplete** snapshot. The league crawl after GW1 remains the only way to get a complete list quickly — roughly 5 days for the full population.
+
+`rank` is `null` for every manager pre-season, since no gameweek has been scored. Rank-based disambiguation in search only starts working after GW1.
 
 ## Quick start
 
@@ -24,10 +64,14 @@ npm run test-run
 # Check what we got
 npm run stats
 
-# Full crawl — run in background, will take many hours
+# PRE-SEASON (before GW1 is scored): standings don't exist, so sweep entry
+# IDs instead. This is the only way to collect managers before the season.
+node src/backfill.js > /dev/null 2>&1 &
+
+# ONCE GW1 IS SCORED: full crawl — run in background, will take many hours
 node src/index.js > /dev/null 2>&1 &
 
-# Backfill managers missed during the crawl (rank shifts mid-scan).
+# Then backfill managers missed during the crawl (rank shifts mid-scan).
 # See "Backfilling missed managers" below.
 node src/backfill.js > /dev/null 2>&1 &
 
@@ -69,10 +113,12 @@ State is keyed by `league_id`, so if you switch leagues (`--league 323` for Seco
 
 The league crawler scans pages of standings sorted by rank. When ranks shift mid-crawl (e.g. across a gameweek, or during a multi-day pause), managers whose rank improves into already-crawled pages get silently skipped. On a multi-day full run this can leave **~1–2% of active managers missing** from the DB.
 
-`src/backfill.js` fixes this by probing entry IDs directly via `/api/entry/{id}/`. Entry IDs are immutable, so this side-steps the moving-target problem entirely:
+`src/backfill.js` fixes this by probing entry IDs directly via `/api/entry/{id}/`. Entry IDs are immutable *within a season* (they are reassigned between seasons — see [Seasons](#seasons)), so this side-steps the moving-target problem entirely:
 
 - 200 → upsert `{id, player_first_name + player_last_name, name, summary_overall_rank}` into `managers`.
 - 404 → record in `dead_entries` so re-runs skip it.
+
+It has two jobs now: filling post-crawl gaps, and acting as the **only** collection method before GW1, when standings don't exist.
 
 ```bash
 # Smoke test: probe 5 missing IDs.
@@ -85,17 +131,17 @@ node src/backfill.js > /dev/null 2>&1 &
 tail -f logs/backfill.log
 ```
 
-The backfill is resumable: the gap set is recomputed from the DB on each run (`[1, max(entry_id)] − managers − dead_entries`). Killing the process at any point loses at most one in-flight request.
+The backfill is resumable: the gap set is recomputed from the DB on each run (`[1, total_players] − managers − dead_entries`), in bounded chunks rather than one big array, so an empty-DB sweep of millions of IDs doesn't materialise them all up front. Killing the process at any point loses at most one in-flight request.
 
 CLI options mirror the crawler's where they overlap:
 
 ```
---upper-bound <n>     Highest entry_id to probe (default: max(entry_id) in DB)
+--upper-bound <n>     Highest entry_id to probe (default: total_players)
 --max-ids <n>         Max IDs to probe in this run (default: unlimited)
 --delay-ms <n>        Min delay between requests in ms (default: 1000)
 --jitter-ms <n>       Max additional random jitter in ms (default: 500)
 --max-retries <n>     Max retries per request (default: 5)
---db <path>           SQLite DB path (default: ./data/fpl.db)
+--db <path>           SQLite DB path (default: ./data/fpl-<season>.db)
 --log <path>          Log file path (default: ./logs/backfill.log)
 --no-log-file         Log to stdout only
 --user-agent <s>      Override User-Agent header
@@ -112,7 +158,7 @@ Default delay is 1000ms (vs 1500ms for the crawler) since per-entry calls are li
 --delay-ms <n>        Min delay between requests in ms (default: 1500)
 --jitter-ms <n>       Max additional random jitter in ms (default: 500)
 --max-retries <n>     Max retries per request (default: 5)
---db <path>           SQLite DB path (default: ./data/fpl.db)
+--db <path>           SQLite DB path (default: ./data/fpl-<season>.db)
 --log <path>          Log file path (default: ./logs/crawler.log)
 --no-log-file         Log to stdout only
 --user-agent <s>      Override User-Agent header
@@ -122,7 +168,7 @@ Exporter (`src/export.js`):
 
 ```
 --out-dir <path>       Output directory (default: ./data/parquet)
---db <path>            SQLite DB path (default: ./data/fpl.db)
+--db <path>            SQLite DB path (default: ./data/fpl-<season>.db)
 --full                 Force a full re-export and re-baseline the watermark
 --delta                Force an incremental export
 --since <ts>           Override the watermark (unix seconds or ISO-8601)
@@ -342,6 +388,7 @@ src/
   backfill.js   Backfiller CLI entry point
   backfiller.js Probes /api/entry/{id}/ for IDs missed by the crawler
   fetcher.js    HTTP with rate limit + retries
+  season.js     Season constant + per-season DB path
   db.js         SQLite schema + prepared statements
   logger.js     Timestamped logger
   export.js     Parquet export CLI (full first, incremental after)

@@ -159,6 +159,61 @@ class FPLDatabase {
   }
 
   /**
+   * The next `limit` entry IDs in (afterId, upperBound] that are in neither
+   * `managers` nor `dead_entries`.
+   *
+   * Returned in chunks rather than all at once or as a generator. A fresh
+   * season starts empty with a bound of ~3.2M rising to ~13M, so the array
+   * version would materialise ~100 MB of IDs before the first request went
+   * out — but a generator is worse than useless here: better-sqlite3 refuses
+   * to run a statement while an iterator is open ("This database connection
+   * is busy executing a query"), and the caller writes to `managers` on every
+   * single ID it consumes. Chunking bounds memory and keeps each read fully
+   * drained before any write happens.
+   */
+  getMissingEntryIdsAfter(afterId, upperBound, limit) {
+    if (!Number.isInteger(upperBound) || upperBound < 1) return [];
+    if (!Number.isInteger(limit) || limit < 1) return [];
+
+    const out = [];
+    const block = Math.max(limit * 4, 50_000);
+    let cursor = Math.max(0, afterId);
+
+    const known = this.db.prepare(
+      'SELECT entry_id FROM managers WHERE entry_id > ? AND entry_id <= ?'
+    );
+    const deadStmt = this.db.prepare(
+      'SELECT entry_id FROM dead_entries WHERE entry_id > ? AND entry_id <= ?'
+    );
+
+    while (out.length < limit && cursor < upperBound) {
+      const blockEnd = Math.min(cursor + block, upperBound);
+      const seen = new Set(known.all(cursor, blockEnd).map((r) => r.entry_id));
+      for (const r of deadStmt.all(cursor, blockEnd)) seen.add(r.entry_id);
+
+      let id = cursor + 1;
+      for (; id <= blockEnd && out.length < limit; id++) {
+        if (!seen.has(id)) out.push(id);
+      }
+      // If the chunk filled mid-block, resume from the last ID we emitted.
+      cursor = out.length >= limit ? out[out.length - 1] : blockEnd;
+    }
+    return out;
+  }
+
+  /** Cheap estimate of how many IDs iterateMissingEntryIds will yield. */
+  countMissingEntryIds(upperBound) {
+    if (!Number.isInteger(upperBound) || upperBound < 1) return 0;
+    const known = this.db
+      .prepare('SELECT COUNT(*) AS c FROM managers WHERE entry_id <= ?')
+      .get(upperBound).c;
+    const dead = this.db
+      .prepare('SELECT COUNT(*) AS c FROM dead_entries WHERE entry_id <= ?')
+      .get(upperBound).c;
+    return Math.max(0, upperBound - known - dead);
+  }
+
+  /**
    * Returns a sorted array of entry_ids in [1, upperBound] that are present
    * in neither `managers` nor `dead_entries`. Streams managers in sorted
    * order to find gaps in a single pass; dead_entries is kept in a Set in

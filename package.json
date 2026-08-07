@@ -16,7 +16,7 @@
     "export-status": "node src/export.js --status",
     "export-dry-run": "node src/export.js --dry-run",
     "stats": "node src/stats.js",
-    "test": "node test-smoke.js && node test-export.js"
+    "test": "node test-smoke.js && node test-export.js && node test-season.js"
   },
   "dependencies": {
     "@dsnp/parquetjs": "^1.8.8",
