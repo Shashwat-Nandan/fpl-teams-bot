@@ -22,8 +22,12 @@ Options:
   --upper-bound <n>     Highest entry_id to probe (default: total_players from
                         bootstrap-static, i.e. every registered team)
   --max-ids <n>         Max IDs to probe in this run (default: unlimited)
-  --delay-ms <n>        Min delay between requests in ms (default: 1000)
-  --jitter-ms <n>       Max additional random jitter in ms (default: 500)
+  --rate <n>            Target requests per second (default: 100). The API
+                        starts returning 429s above ~150/s.
+  --concurrency <n>     Requests in flight at once (default: 16). Hides network
+                        latency; the rate above is what bounds throughput.
+  --delay-ms <n>        Min delay between requests in ms. Overrides --rate.
+  --jitter-ms <n>       Max additional random jitter in ms
   --max-retries <n>     Max retries per request (default: 5)
   --db <path>           SQLite DB path (default: ./data/fpl-<season>.db)
   --log <path>          Log file path (default: ./logs/backfill.log)
@@ -35,24 +39,41 @@ Examples:
   # Smoke test: probe 5 missing IDs.
   node src/backfill.js --max-ids 5
 
-  # Full backfill, run in background.
+  # Full backfill, run in background (~9h for a full 3.2M sweep).
   node src/backfill.js > /dev/null 2>&1 &
+
+  # Back off if the API starts pushing back.
+  node src/backfill.js --rate 50
 
   # Re-run after kill — picks up automatically (gaps are recomputed from DB).
 `);
+}
+
+const DEFAULT_RATE = 100;
+
+/**
+ * Split a target request rate into a minimum spacing plus jitter averaging to
+ * the same thing, so a fleet of workers doesn't fire in lockstep.
+ */
+function spacingForRate(rate) {
+  const avg = 1000 / rate;
+  return { minDelayMs: avg * 0.8, maxJitterMs: avg * 0.4 };
 }
 
 function parseArgs(argv) {
   const opts = {
     upperBound: null,
     maxIds: Infinity,
-    minDelayMs: 1000,
-    maxJitterMs: 500,
+    ...spacingForRate(DEFAULT_RATE),
+    concurrency: 16,
     maxRetries: 5,
     dbPath: defaultDbPath(),
     logFile: path.join(process.cwd(), 'logs', 'backfill.log'),
     userAgent: undefined,
   };
+
+  let rate = null;
+  const explicit = {};
 
   for (let i = 2; i < argv.length; i++) {
     const a = argv[i];
@@ -67,8 +88,10 @@ function parseArgs(argv) {
     switch (a) {
       case '--upper-bound':  opts.upperBound = parseInt(next(), 10); break;
       case '--max-ids':      opts.maxIds = parseInt(next(), 10); break;
-      case '--delay-ms':     opts.minDelayMs = parseInt(next(), 10); break;
-      case '--jitter-ms':    opts.maxJitterMs = parseInt(next(), 10); break;
+      case '--rate':         rate = parseFloat(next()); break;
+      case '--concurrency':  opts.concurrency = parseInt(next(), 10); break;
+      case '--delay-ms':     explicit.minDelayMs = parseInt(next(), 10); break;
+      case '--jitter-ms':    explicit.maxJitterMs = parseInt(next(), 10); break;
       case '--max-retries':  opts.maxRetries = parseInt(next(), 10); break;
       case '--db':           opts.dbPath = next(); break;
       case '--log':          opts.logFile = next(); break;
@@ -84,6 +107,21 @@ function parseArgs(argv) {
         printHelp();
         process.exit(2);
     }
+  }
+
+  if (rate !== null) {
+    if (!Number.isFinite(rate) || rate <= 0) {
+      console.error('--rate must be a positive number of requests per second.');
+      process.exit(2);
+    }
+    Object.assign(opts, spacingForRate(rate));
+  }
+  // Applied last so --delay-ms/--jitter-ms win regardless of argument order.
+  Object.assign(opts, explicit);
+
+  if (!Number.isInteger(opts.concurrency) || opts.concurrency < 1) {
+    console.error('--concurrency must be a positive integer.');
+    process.exit(2);
   }
   return opts;
 }
@@ -102,14 +140,17 @@ async function main() {
   const backfiller = new Backfiller({
     upperBound: opts.upperBound,
     maxIds: opts.maxIds,
+    concurrency: opts.concurrency,
     db,
     fetcher,
     logger,
   });
 
+  const effectiveRate = 1000 / (opts.minDelayMs + opts.maxJitterMs / 2);
   logger.info(
     `Backfill config: upperBound=${opts.upperBound ?? 'auto'} ` +
-      `maxIds=${opts.maxIds} delayMs=${opts.minDelayMs} ` +
+      `maxIds=${opts.maxIds} rate=~${effectiveRate.toFixed(0)}/s ` +
+      `concurrency=${opts.concurrency} delayMs=${opts.minDelayMs} ` +
       `jitterMs=${opts.maxJitterMs} db=${opts.dbPath}`
   );
 

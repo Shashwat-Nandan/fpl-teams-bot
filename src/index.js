@@ -21,8 +21,8 @@ Options:
   --league <id>         League ID to crawl (default: 314 = Overall)
   --start-page <n>      Start page (default: 1, or resumes from checkpoint)
   --max-pages <n>       Max pages this run (default: unlimited)
-  --delay-ms <n>        Min delay between requests in ms (default: 1500)
-  --jitter-ms <n>       Max additional random jitter in ms (default: 500)
+  --delay-ms <n>        Min delay between requests in ms (default: 50)
+  --jitter-ms <n>       Max additional random jitter in ms (default: 25)
   --max-retries <n>     Max retries per request (default: 5)
   --db <path>           SQLite DB path (default: ./data/fpl-<season>.db)
   --log <path>          Log file path (default: ./logs/crawler.log)
@@ -46,8 +46,14 @@ function parseArgs(argv) {
     leagueId: 314,
     startPage: 1,
     maxPages: Infinity,
-    minDelayMs: 1500,
-    maxJitterMs: 500,
+    // Pagination is inherently serial — page N+1 is only reachable once page
+    // N reports has_next — so at most one request is ever in flight and the
+    // ~40ms round trip caps us near 15/s however small this gets. That is an
+    // order of magnitude under the rate at which the API starts pushing back
+    // (see the table in fetcher.js), so there is nothing to gain from waiting
+    // longer between pages.
+    minDelayMs: 50,
+    maxJitterMs: 25,
     maxRetries: 5,
     dbPath: defaultDbPath(),
     logFile: path.join(process.cwd(), 'logs', 'crawler.log'),

@@ -48,7 +48,7 @@ The entry endpoint **does** work pre-season, so `src/backfill.js` is the only wa
 node src/backfill.js > /dev/null 2>&1 &
 ```
 
-Be realistic about the arithmetic: at the default ~1.25 s/request, 3.2M registered teams is **~46 days**, and registrations keep growing until the GW1 deadline (2025-26 finished with 13.08M IDs issued, and the count was climbing ~60k/day in early August). A pre-season sweep produces a large but **incomplete** snapshot. The league crawl after GW1 remains the only way to get a complete list quickly — roughly 5 days for the full population.
+At the default 100 requests/second this sweeps 3.2M registered teams in **~9 hours**. Registrations keep growing until the GW1 deadline (2025-26 finished with 13.08M IDs issued, and the count was climbing ~60k/day in early August), so re-run it to pick up the stragglers — each run only probes IDs it has not already stored or marked dead.
 
 `rank` is `null` for every manager pre-season, since no gameweek has been scored. Rank-based disambiguation in search only starts working after GW1.
 
@@ -68,7 +68,8 @@ npm run stats
 # IDs instead. This is the only way to collect managers before the season.
 node src/backfill.js > /dev/null 2>&1 &
 
-# ONCE GW1 IS SCORED: full crawl — run in background, will take many hours
+# ONCE GW1 IS SCORED: full crawl — run in background, ~1-2h for the full
+# population (63k pages of 50, serial because pagination is)
 node src/index.js > /dev/null 2>&1 &
 
 # Then backfill managers missed during the crawl (rank shifts mid-scan).
@@ -81,26 +82,41 @@ npm run export
 
 ## How rate limiting works
 
-Built to be a good citizen on an unofficial API.
+Requests pass through a shared gate that spaces out request *starts*, so the rate holds no matter how many workers are running. Workers exist only to hide the ~40 ms round trip; the gate is what bounds throughput.
 
-| Layer              | Default        | Configurable via        |
-| ------------------ | -------------- | ----------------------- |
-| Min delay          | 1500 ms        | `--delay-ms`            |
-| Random jitter      | 0–500 ms       | `--jitter-ms`           |
-| Max retries        | 5              | `--max-retries`         |
-| Retry backoff      | exponential, capped 60s | —              |
-| 429 `Retry-After`  | respected      | —                       |
-| Timeout            | 30 s           | —                       |
-| Concurrency        | 1 (serial)     | —                       |
+| Layer              | Backfiller     | Crawler        | Configurable via        |
+| ------------------ | -------------- | -------------- | ----------------------- |
+| Target rate        | 100 req/s      | ~15 req/s (latency-bound) | `--rate`     |
+| Min delay          | 8 ms           | 50 ms          | `--delay-ms`            |
+| Random jitter      | 0–4 ms         | 0–25 ms        | `--jitter-ms`           |
+| Concurrency        | 16             | 1 (serial)     | `--concurrency`         |
+| Max retries        | 5              | 5              | `--max-retries`         |
+| Retry backoff      | exponential, capped 60s | —     | —                       |
+| 429 `Retry-After`  | respected when sent (FPL sends none) | — | —      |
+| Timeout            | 30 s           | 30 s           | —                       |
 
-Effective pace: ~30–40 requests/minute, ~1,500–2,000 managers/minute. A full crawl of ~11M managers takes ~5–7 days on defaults. Bump `--delay-ms` down to 1000 to roughly halve that if you're comfortable.
+### Where the defaults come from
+
+Measured against the live API on 2026-08-07, sustained 90-second windows at a fixed issue rate:
+
+| target rate | 429s  | notes                              |
+| ----------- | ----- | ---------------------------------- |
+| 20/s        | 0.0%  |                                    |
+| 50/s        | 0.0%  |                                    |
+| **100/s**   | 0.0%  | default; also clean over a 10-min soak (34.5k requests) |
+| 150/s       | 1.0%  | creeping upward — a bucket draining |
+| 200/s       | 14.6% | effective good throughput only 170/s |
+
+The knee sits just under 150/s, so the default targets 100/s for headroom. Unthrottled bursts reach ~350/s, which is how the limiter gets tripped in the first place — short bursts look fine and then a sustained run starts bleeding 429s.
+
+The league crawler is left serial because pagination is: page N+1 is only reachable once page N reports `has_next`. At most one request is ever in flight, so the round trip caps it near 15/s however small `--delay-ms` gets — an order of magnitude below the knee.
 
 ### If you hit 429s
 
-The fetcher automatically respects `Retry-After`. If you see sustained 429s in the log, bump the delay:
+The fetcher counts them (reported in the backfiller's progress lines) and a 429 pushes back *every* worker's next slot, not just the request that was rejected. If they persist, lower the rate:
 
 ```bash
-node src/index.js --delay-ms 3000
+node src/backfill.js --rate 50
 ```
 
 ## Resumability
@@ -124,22 +140,26 @@ It has two jobs now: filling post-crawl gaps, and acting as the **only** collect
 # Smoke test: probe 5 missing IDs.
 npm run backfill-test
 
-# Full backfill (run in background — typically a few days for ~360k gaps).
+# Full backfill (run in background — ~1h per 360k gaps at the default rate).
 node src/backfill.js > /dev/null 2>&1 &
 
 # Tail progress.
 tail -f logs/backfill.log
 ```
 
-The backfill is resumable: the gap set is recomputed from the DB on each run (`[1, total_players] − managers − dead_entries`), in bounded chunks rather than one big array, so an empty-DB sweep of millions of IDs doesn't materialise them all up front. Killing the process at any point loses at most one in-flight request.
+The backfill is resumable: the gap set is recomputed from the DB on each run (`[1, total_players] − managers − dead_entries`), in bounded chunks rather than one big array, so an empty-DB sweep of millions of IDs doesn't materialise them all up front. Killing the process at any point loses at most `--concurrency` in-flight requests, and those IDs are simply still gaps next time.
+
+Probing runs concurrently: workers pull from a shared cursor into the current chunk, so a request stuck in retry doesn't idle the rest of the pool. `--max-ids` is an exact ceiling — a worker claims its slot when it takes an ID, not when the response lands.
 
 CLI options mirror the crawler's where they overlap:
 
 ```
 --upper-bound <n>     Highest entry_id to probe (default: total_players)
 --max-ids <n>         Max IDs to probe in this run (default: unlimited)
---delay-ms <n>        Min delay between requests in ms (default: 1000)
---jitter-ms <n>       Max additional random jitter in ms (default: 500)
+--rate <n>            Target requests per second (default: 100)
+--concurrency <n>     Requests in flight at once (default: 16)
+--delay-ms <n>        Min delay between requests in ms. Overrides --rate.
+--jitter-ms <n>       Max additional random jitter in ms
 --max-retries <n>     Max retries per request (default: 5)
 --db <path>           SQLite DB path (default: ./data/fpl-<season>.db)
 --log <path>          Log file path (default: ./logs/backfill.log)
@@ -147,7 +167,7 @@ CLI options mirror the crawler's where they overlap:
 --user-agent <s>      Override User-Agent header
 ```
 
-Default delay is 1000ms (vs 1500ms for the crawler) since per-entry calls are lighter — bump `--delay-ms` if you see sustained 429s.
+Raising `--concurrency` past `rate × latency` (≈4 at the defaults) buys nothing — the rate gate, not the worker count, is what limits throughput. It is set to 16 only so that a burst of slow responses can't starve the gate.
 
 ## CLI options
 
@@ -155,8 +175,8 @@ Default delay is 1000ms (vs 1500ms for the crawler) since per-entry calls are li
 --league <id>         League ID to crawl (default: 314 = Overall)
 --start-page <n>      Start page (default: 1, or resumes from checkpoint)
 --max-pages <n>       Max pages this run (default: unlimited)
---delay-ms <n>        Min delay between requests in ms (default: 1500)
---jitter-ms <n>       Max additional random jitter in ms (default: 500)
+--delay-ms <n>        Min delay between requests in ms (default: 50)
+--jitter-ms <n>       Max additional random jitter in ms (default: 25)
 --max-retries <n>     Max retries per request (default: 5)
 --db <path>           SQLite DB path (default: ./data/fpl-<season>.db)
 --log <path>          Log file path (default: ./logs/crawler.log)

@@ -5,11 +5,25 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 /**
  * Polite HTTP fetcher for the FPL API.
  *
- * Rate limiting: enforces a minimum delay between successive requests, plus
- * a small random jitter so we don't hammer the API in perfectly periodic bursts.
+ * Rate limiting: a shared slot reservation enforces a global request rate of
+ * roughly 1000/(minDelayMs + jitter/2) per second across every caller sharing
+ * this instance. Callers may run concurrently — the gate spaces out request
+ * *starts*, so N workers overlap network latency without exceeding the rate.
  *
- * Retries: on 429 (respecting Retry-After), 5xx, and network errors. 4xx other
- * than 429 are considered non-retryable and surfaced to the caller.
+ * Measured against the live API (2026-08-07, sustained 90s windows):
+ *
+ *     rate      429s
+ *     20/s      0.0%
+ *     50/s      0.0%
+ *    100/s      0.0%
+ *    150/s      1.0%   (creeping upwards — a bucket draining)
+ *    200/s     14.6%
+ *
+ * 429 responses carry no Retry-After header, so the backoff below is what
+ * governs recovery. The knee sits just under 150/s; defaults target 100/s.
+ *
+ * Retries: on 429 (respecting Retry-After when present), 5xx, and network
+ * errors. 4xx other than 429 are non-retryable and surfaced to the caller.
  */
 class Fetcher {
   constructor(opts = {}) {
@@ -22,16 +36,44 @@ class Fetcher {
       'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 ' +
         '(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36';
     this.logger = opts.logger ?? null;
-    this.lastRequestAt = 0;
+    // Earliest wall-clock time the next request may start. Reserving a slot
+    // both reads and advances this, which is why it must happen with no await
+    // in between — see _reserveSlot.
+    this.nextSlotAt = 0;
+    this.rateLimitHits = 0;
+  }
+
+  /**
+   * Claim the next request slot and return how long to wait for it.
+   *
+   * This is deliberately synchronous. JS runs it to completion without
+   * interleaving, so concurrent callers each walk `nextSlotAt` forward by one
+   * spacing and get distinct slots. The previous implementation compared
+   * against a `lastRequestAt` that it only updated *after* sleeping, so N
+   * concurrent callers all measured the same stale timestamp and fired
+   * together — the rate limit held only while requests were serialized.
+   */
+  _reserveSlot() {
+    const spacing = this.minDelayMs + Math.random() * this.maxJitterMs;
+    const now = Date.now();
+    const at = Math.max(now, this.nextSlotAt);
+    this.nextSlotAt = at + spacing;
+    return at - now;
+  }
+
+  /**
+   * Push every reserved slot back, so a 429 slows down all in-flight workers
+   * rather than only the one that happened to receive it. Without this, a
+   * concurrent fleet keeps issuing at the same rate while individual workers
+   * back off, and the rate limiter never gets the pause it asked for.
+   */
+  _delayAllSlots(ms) {
+    this.nextSlotAt = Math.max(this.nextSlotAt, Date.now() + ms);
   }
 
   async _throttle() {
-    const now = Date.now();
-    const elapsed = now - this.lastRequestAt;
-    const jitter = Math.random() * this.maxJitterMs;
-    const wait = Math.max(0, this.minDelayMs + jitter - elapsed);
+    const wait = this._reserveSlot();
     if (wait > 0) await sleep(wait);
-    this.lastRequestAt = Date.now();
   }
 
   _backoffMs(attempt) {
@@ -68,10 +110,13 @@ class Fetcher {
 
         if (res.status === 429) {
           lastStatus = 429;
+          this.rateLimitHits++;
           const retryAfterHeader = res.headers.get('retry-after');
           const retryAfterSec = parseInt(retryAfterHeader || '0', 10);
           const wait =
             retryAfterSec > 0 ? retryAfterSec * 1000 : this._backoffMs(attempt);
+          // Hold back every other worker too, not just this request.
+          this._delayAllSlots(wait);
           this.logger?.warn(
             `429 Too Many Requests on ${url}. Waiting ${wait}ms (attempt ${attempt + 1})`
           );
