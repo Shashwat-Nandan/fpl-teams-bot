@@ -100,7 +100,7 @@ function tick(seconds = 2) {
   );
 
   // ---------- 2. no changes → empty delta ----------
-  const noop = await newExporter(db, outDir, { overlapSeconds: 0 }).run();
+  const noop = await newExporter(db, outDir, { lagSeconds: 0 }).run();
   assert.strictEqual(noop.kind, 'delta', 'second run should be incremental');
   assert.strictEqual(noop.rows, 0, 'no changes should produce no delta rows');
   assert.strictEqual(noop.files.length, 0, 'no changes should write no files');
@@ -113,7 +113,7 @@ function tick(seconds = 2) {
   ]);
   tick();
 
-  const rankOnly = await newExporter(db, outDir, { overlapSeconds: 0 }).run();
+  const rankOnly = await newExporter(db, outDir, { lagSeconds: 0 }).run();
   assert.strictEqual(
     rankOnly.rows,
     0,
@@ -133,7 +133,7 @@ function tick(seconds = 2) {
   ]);
   tick();
 
-  const delta = await newExporter(db, outDir, { overlapSeconds: 0 }).run();
+  const delta = await newExporter(db, outDir, { lagSeconds: 0 }).run();
   assert.strictEqual(delta.kind, 'delta');
   assert.strictEqual(delta.rows, 2, `expected 2 delta rows, got ${delta.rows}`);
   assert.strictEqual(delta.files.length, 1, 'small delta should be one file');
@@ -160,20 +160,55 @@ function tick(seconds = 2) {
     watermark,
     'watermark should persist across connections'
   );
-  const afterReopen = await newExporter(db, outDir, { overlapSeconds: 0 }).run();
+  const afterReopen = await newExporter(db, outDir, { lagSeconds: 0 }).run();
   assert.strictEqual(afterReopen.rows, 0, 'reopened DB should have no backlog');
 
-  // ---------- 6. overlap re-emits the boundary second (at-least-once) ----------
-  const overlapped = await newExporter(db, outDir, { overlapSeconds: 60 }).run();
-  assert.ok(
-    overlapped.rows >= 2,
-    `overlap should re-emit boundary rows, got ${overlapped.rows}`
+  // ---------- 6. idle runs at the DEFAULT lag write nothing, repeatedly ----------
+  // Regression: an earlier design rewound `lo` by overlapSeconds instead of
+  // holding `hi` back, so lo < hi always held and every single run re-emitted
+  // the boundary second — an idle database grew one duplicate delta file per
+  // night forever. Uses the default lag (no lagSeconds override) on purpose.
+  const filesBeforeIdle = fs.readdirSync(outDir).length;
+  for (let i = 0; i < 3; i++) {
+    const idle = await newExporter(db, outDir).run();
+    assert.strictEqual(
+      idle.rows,
+      0,
+      `idle run ${i + 1} at the default lag should export 0 rows, got ${idle.rows}`
+    );
+    assert.strictEqual(
+      idle.files.length,
+      0,
+      `idle run ${i + 1} should write no file`
+    );
+  }
+  assert.strictEqual(
+    fs.readdirSync(outDir).length,
+    filesBeforeIdle,
+    'idle runs must not accumulate files in the output directory'
+  );
+
+  // The lag must actually hold back the newest second: a row written right now
+  // is not eligible until it has aged past --lag-seconds.
+  db.upsertBatch([mkManager(1005, 'Too Fresh', 'Just Written FC', 5)]);
+  const tooFresh = await newExporter(db, outDir, { lagSeconds: 30 }).run();
+  assert.strictEqual(
+    tooFresh.rows,
+    0,
+    'a row younger than lagSeconds must not be exported yet'
+  );
+  tick();
+  const nowEligible = await newExporter(db, outDir, { lagSeconds: 0 }).run();
+  assert.strictEqual(
+    nowEligible.rows,
+    1,
+    'the held-back row must appear once the lag no longer covers it'
   );
 
   // ---------- 7. --full re-baselines ----------
   const refull = await newExporter(db, outDir, { mode: 'full' }).run();
   assert.strictEqual(refull.kind, 'full');
-  assert.strictEqual(refull.rows, 4, 'full re-export should contain all 4 rows');
+  assert.strictEqual(refull.rows, 5, 'full re-export should contain all 5 rows');
 
   // ---------- 8. part-file rollover ----------
   tick();
@@ -185,7 +220,7 @@ function tick(seconds = 2) {
   tick();
 
   const rolled = await newExporter(db, outDir, {
-    overlapSeconds: 0,
+    lagSeconds: 0,
     rowsPerFile: 10,
   }).run();
   assert.strictEqual(rolled.rows, 25);
@@ -211,7 +246,7 @@ function tick(seconds = 2) {
   const before = db.getExportState('managers').watermark;
   const filesBefore = fs.readdirSync(outDir).length;
   const dry = await newExporter(db, outDir, {
-    overlapSeconds: 0,
+    lagSeconds: 0,
     dryRun: true,
   }).run();
   assert.strictEqual(dry.rows, 1, 'dry run should report the pending row');
@@ -228,12 +263,13 @@ function tick(seconds = 2) {
   );
 
   // ---------- 10. failure leaves no partial output, watermark unmoved ----------
-  const failing = newExporter(db, outDir, { overlapSeconds: 0, rowsPerFile: 1 });
+  const failing = newExporter(db, outDir, { lagSeconds: 0, rowsPerFile: 1 });
   // Wrap the real DB, but make the row scan blow up partway through so we can
   // observe cleanup. Methods are listed explicitly because spreading a class
   // instance would not carry its prototype methods across.
   failing.db = {
-    ensureLastUpdatedIndex: () => false,
+    hasLastUpdatedIndex: () => true,
+    buildLastUpdatedIndex: () => {},
     beginRead: () => db.beginRead(),
     endRead: () => db.endRead(),
     getExportState: (d) => db.getExportState(d),
@@ -301,7 +337,7 @@ function tick(seconds = 2) {
     db.upsertBatch(bulk);
     tick();
     const out = await newExporter(db, outDir, {
-      overlapSeconds: 0,
+      lagSeconds: 0,
       mode: 'full',
       compression: codec,
     }).run();
@@ -313,6 +349,69 @@ function tick(seconds = 2) {
       'compression is not reaching the writer'
   );
 
+  // ---------- 12. a failing recordExport must not orphan finished files ----------
+  // Regression: `writer` used to be nulled before recordExport, so a commit
+  // failure skipped abort() and left a complete-looking export directory that
+  // no export_runs row described — and that the documented
+  // managers_full_*/part-*.parquet glob would still load.
+  tick();
+  db.upsertBatch([mkManager(8001, 'Orphan Check', 'Commit Fail FC', 1)]);
+  tick();
+
+  const orphan = newExporter(db, outDir, { lagSeconds: 0 });
+  const realRecord = db.recordExport.bind(db);
+  db.recordExport = () => {
+    throw new Error('simulated SQLITE_BUSY on commit');
+  };
+  const wmBeforeCommit = db.getExportState('managers').watermark;
+  const dirBeforeCommit = fs.readdirSync(outDir).sort();
+  await assert.rejects(
+    () => orphan.run(),
+    /simulated SQLITE_BUSY on commit/,
+    'commit failures should surface'
+  );
+  db.recordExport = realRecord;
+  assert.deepStrictEqual(
+    fs.readdirSync(outDir).sort(),
+    dirBeforeCommit,
+    'a failed commit must not leave an orphan export directory behind'
+  );
+  assert.strictEqual(
+    db.getExportState('managers').watermark,
+    wmBeforeCommit,
+    'a failed commit must not advance the watermark'
+  );
+  // The row is still pending, so the retry picks it up normally.
+  const retried = await newExporter(db, outDir, { lagSeconds: 0 }).run();
+  assert.strictEqual(retried.rows, 1, 'retry after a failed commit should export the row');
+
+  // ---------- 13. --dry-run must not build the index ----------
+  const freshPath = path.join(tmp, 'fresh.db');
+  const freshDb = new FPLDatabase(freshPath);
+  freshDb.upsertBatch([mkManager(1, 'A B', 'T', 1)]);
+  tick();
+  assert.strictEqual(
+    freshDb.hasLastUpdatedIndex(),
+    false,
+    'a fresh DB should not have idx_last_updated'
+  );
+  await newExporter(freshDb, path.join(tmp, 'fresh-out'), {
+    lagSeconds: 0,
+    dryRun: true,
+  }).run();
+  assert.strictEqual(
+    freshDb.hasLastUpdatedIndex(),
+    false,
+    '--dry-run must not build the index — it takes SQLite\'s write lock'
+  );
+  await newExporter(freshDb, path.join(tmp, 'fresh-out'), { lagSeconds: 0 }).run();
+  assert.strictEqual(
+    freshDb.hasLastUpdatedIndex(),
+    true,
+    'a real run should build the index'
+  );
+  freshDb.close();
+
   db.close();
   fs.rmSync(tmp, { recursive: true, force: true });
 
@@ -322,12 +421,15 @@ function tick(seconds = 2) {
   console.log('   - Rank-only churn does not dirty rows: ✓');
   console.log('   - Name/team change + new manager appear in delta: ✓');
   console.log('   - Watermark persisted across connections: ✓');
-  console.log('   - Overlap makes deltas at-least-once: ✓');
+  console.log('   - Lag holds back rows too fresh to be safe: ✓');
   console.log('   - --full re-baseline: ✓');
   console.log('   - Part-file rollover: ✓');
   console.log('   - --dry-run is side-effect free: ✓');
   console.log('   - Failure leaves no partial files / watermark: ✓');
   console.log('   - --compression reaches the columns and shrinks output: ✓');
+  console.log('   - Idle runs at the default lag write nothing: ✓');
+  console.log('   - Failed commit orphans no files, watermark unmoved: ✓');
+  console.log('   - --dry-run does not build the index: ✓');
 })().catch((e) => {
   console.error('\n❌ Export test failed:', e);
   process.exit(1);

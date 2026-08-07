@@ -5,7 +5,7 @@ const path = require('path');
 const fs = require('fs');
 
 class FPLDatabase {
-  constructor(dbPath) {
+  constructor(dbPath, opts = {}) {
     const dir = path.dirname(dbPath);
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 
@@ -13,6 +13,12 @@ class FPLDatabase {
     // WAL gives us concurrent reads while crawler writes, and is much faster.
     this.db.pragma('journal_mode = WAL');
     this.db.pragma('synchronous = NORMAL');
+    // The default 5s busy timeout is far too short to survive the exporter's
+    // one-time CREATE INDEX, which holds the write lock for minutes on a
+    // multi-million-row table. Without this the crawler dies with
+    // SQLITE_BUSY mid-crawl (it has no retry around upsertBatch) the first
+    // time an export runs alongside it.
+    this.db.pragma(`busy_timeout = ${opts.busyTimeoutMs ?? 600_000}`);
 
     this._initSchema();
     this._prepareStatements();
@@ -257,21 +263,24 @@ class FPLDatabase {
     return this._export;
   }
 
-  /**
-   * Delta exports scan `WHERE last_updated > ? AND last_updated <= ?`, which
-   * is a full table scan without this index. Created on demand (the first
-   * export pays for it) so crawler startup is never blocked by an index build
-   * over millions of rows. Returns true if it actually built the index.
-   */
-  ensureLastUpdatedIndex() {
-    const existing = this.db
+  hasLastUpdatedIndex() {
+    return !!this.db
       .prepare("SELECT 1 FROM sqlite_master WHERE type='index' AND name=?")
       .get('idx_last_updated');
-    if (existing) return false;
+  }
+
+  /**
+   * Delta exports scan `WHERE last_updated > ? AND last_updated <= ?`, which
+   * is a full table scan without this index. Built on demand by the exporter
+   * (never in _initSchema) so crawler startup is never blocked by an index
+   * build over millions of rows.
+   *
+   * Callers must warn first: this holds SQLite's write lock for the duration.
+   */
+  buildLastUpdatedIndex() {
     this.db.exec(
       'CREATE INDEX IF NOT EXISTS idx_last_updated ON managers(last_updated)'
     );
-    return true;
   }
 
   /**

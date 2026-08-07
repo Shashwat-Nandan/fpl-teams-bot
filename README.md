@@ -128,7 +128,7 @@ Exporter (`src/export.js`):
 --since <ts>           Override the watermark (unix seconds or ISO-8601)
 --rows-per-file <n>    Rows per parquet part file (default: 2000000)
 --compression <c>      GZIP | SNAPPY | UNCOMPRESSED (default: GZIP)
---overlap-seconds <n>  Watermark rewind for safe overlap (default: 1)
+--lag-seconds <n>      Hold the newest n seconds back from export (default: 1)
 --dry-run              Report what would be exported; write nothing
 --status               Print watermark + recent export history, then exit
 --dataset <name>       Watermark key, to feed several targets independently
@@ -176,6 +176,8 @@ CREATE TABLE export_runs (
 Conflicts on `entry_id` are UPSERTed, so re-crawls refresh names/ranks for existing managers.
 
 **`last_updated` is a change marker, not a "last seen" timestamp.** A re-crawl that finds a manager unchanged leaves it alone, and a **rank-only** change refreshes `rank` but deliberately does *not* bump `last_updated`. Ranks churn for nearly every one of the ~12.7M managers after each gameweek, so if rank counted as a change, every "incremental" export would be a full one. Only `player_name` / `team_name` changes — the fields the search actually uses — mark a row dirty.
+
+> **Consequence for `rank` downstream.** Because a rank change never dirties a row, it is never carried by a delta. `rank` stays fresh in SQLite but the copy in Postgres freezes at whatever the last full snapshot recorded, for every manager whose name and team never change — which is nearly all of them. That is the right trade if `rank` is only a disambiguator in search results, which is what it is here. If you ever need `rank` to be accurate downstream, schedule a periodic `npm run export-full` (weekly is plenty) to re-baseline it; a delta run will never fix it.
 
 ## Exporting to Parquet (full, then incremental)
 
@@ -242,15 +244,23 @@ full export complete: 12,741,486 rows in 7 file(s), 243.6 MB, 416s
 The watermark lives in SQLite (`export_state.watermark`), not on disk, so the parquet directory can be moved or cleared without losing your place. Each run:
 
 1. opens a **read transaction**, so the watermark read and the row scan share one consistent snapshot even while the crawler is writing;
-2. takes `hi = MAX(last_updated)`, clamped to `now - 1` so the second still in progress is never exported half-finished;
-3. exports rows in `(lo, hi]`;
-4. advances the watermark to `hi` — only after every file is closed.
+2. takes `hi = MAX(last_updated)`, capped at `now - 1 - lagSeconds`;
+3. exports rows in `(lo, hi]`, where `lo` is the stored watermark;
+4. advances the watermark to `hi` — only after every file is closed **and** the run has been recorded.
 
-If a run crashes or is killed, partial parquet files are deleted and the watermark stays put, so the next run cleanly redoes the same range.
+An export is all-or-nothing. If a run crashes, is killed, or fails to record itself, every file it wrote is deleted and the watermark stays put, so the next run cleanly redoes the range. That deliberately throws away parts that had already finished — half a run left on disk would be indistinguishable from a complete one to the `managers_full_*/part-*.parquet` glob consumers are told to use.
 
-**Deltas are at-least-once.** `last_updated` only has 1-second resolution and the crawler stamps its timestamp at the start of a transaction rather than at commit, so the lower bound is rewound by `--overlap-seconds` (default 1) to guarantee nothing is skipped. The cost is that the boundary second's rows can be re-emitted. Apply deltas downstream as an **UPSERT on `entry_id`**, never a blind INSERT. Set `--overlap-seconds 0` if nothing is writing concurrently.
+**Why the upper bound lags.** `last_updated` has only 1-second resolution and the crawler stamps its timestamp at the start of a transaction rather than at commit, so a batch stamped second `T` can commit just after an exporter snapshot that already passed `T`. Holding `hi` back by `--lag-seconds` (default 1) gives such a transaction time to land before its second is ever declared done. An earlier design rewound the *lower* bound instead, which closed the same hole but re-emitted the boundary second on every run — an idle database grew one duplicate delta file every night, forever.
 
-The first export builds `idx_last_updated` over the whole `managers` table (a one-time cost paid by the exporter, not the crawler — crawler startup is never blocked by it).
+Deltas are still **at-least-once** overall: a crash between writing the files and recording the run replays that range. Apply them downstream as an **UPSERT on `entry_id`**, never a blind INSERT.
+
+Only one export per dataset can run at a time, enforced by a `.{dataset}.export.lock` file in the output directory (stale locks from a `kill -9` are detected via the recorded PID and reclaimed). Without it, two runs would pick the same timestamped base name and truncate each other's parquet.
+
+### The one-time index build
+
+The first real export builds `idx_last_updated` over the whole `managers` table. This **takes SQLite's write lock for the duration** — about a minute on 12.7M rows, and it adds ~171 MB to the DB. A crawler writing to the same database will block until it finishes, which is why `FPLDatabase` sets `busy_timeout` to 10 minutes; with SQLite's 5-second default the crawler would die with `SQLITE_BUSY` mid-crawl instead of waiting.
+
+`--dry-run` never builds the index (it is documented as having no side effects), so a dry run on a DB that lacks it falls back to a slower full table scan and says so.
 
 ## Importing to Supabase / Postgres
 
@@ -321,7 +331,7 @@ screen -dmS fpl-crawler bash -c 'cd /opt/fpl-crawler && node src/index.js'
 0 3 * * *  cd /opt/fpl-crawler && node src/export.js >> logs/cron.log 2>&1
 ```
 
-The exporter is safe to run while the crawler is still going — it reads from a consistent snapshot, and anything written after that snapshot is simply picked up by the next run.
+The exporter is safe to run while the crawler is still going — it reads from a consistent snapshot, and anything written after that snapshot is simply picked up by the next run. The one exception is the **first** export, which builds `idx_last_updated` and holds the write lock while it does (see above) — the crawler will stall for the length of that build rather than fail, thanks to the raised `busy_timeout`. Run the first export when the crawler is idle if you'd rather avoid the stall entirely.
 
 ## Files
 

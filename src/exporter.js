@@ -21,24 +21,33 @@ const { PartitionedParquetWriter, toParquetRow } = require('./parquet');
  *
  *   1. opens a read transaction, so the watermark read and the row scan see
  *      one consistent snapshot even while the crawler is writing;
- *   2. reads hi = MAX(last_updated), clamped to now-1 so the second that is
- *      still in progress is never exported half-finished;
- *   3. exports rows in (lo, hi], where lo is the stored watermark rewound by
- *      `overlapSeconds`;
- *   4. advances the watermark to hi — only after every file is closed.
+ *   2. computes hi = MAX(last_updated), capped at `now - 1 - lagSeconds`;
+ *   3. exports rows in (lo, hi], where lo is the stored watermark;
+ *   4. advances the watermark to hi — only after every file is closed AND the
+ *      run has been recorded.
  *
  * A crash mid-run leaves the watermark untouched and the partial files
  * deleted, so the next run simply redoes the same range.
  *
- * Why the overlap: `last_updated` only has 1-second resolution, and the
- * crawler stamps `now` at the top of its transaction rather than at commit.
- * A batch that stamps second T but commits just after the exporter's snapshot
- * would be invisible to this run and excluded from the next one by a strict
- * `> T`. Rewinding the lower bound by one second closes that hole, at the
- * price of re-emitting the boundary second's rows. Deltas are therefore
- * AT-LEAST-ONCE: apply them downstream as an UPSERT on entry_id, never as a
- * blind INSERT. Set overlapSeconds to 0 for exactly-once-ish behaviour if you
- * know nothing is writing concurrently.
+ * Why hi lags instead of lo rewinding
+ * -----------------------------------
+ * `last_updated` only has 1-second resolution, and the crawler stamps `now`
+ * at the top of its transaction rather than at commit. A batch that stamps
+ * second T but commits just after the exporter's snapshot would be invisible
+ * to this run, and a strict `> T` would exclude it from the next one too.
+ *
+ * The fix is to hold the *upper* bound back rather than to rewind the lower
+ * one: a second is only eligible for export once it is `lagSeconds` in the
+ * past, which gives any transaction that stamped it that long to commit. An
+ * earlier version rewound `lo` instead, which closed the same hole but
+ * re-emitted the boundary second on every run — so an idle database produced
+ * a duplicate delta file every single night, forever. Lagging `hi` closes the
+ * hole with no duplicates and makes "nothing changed" genuinely export
+ * nothing.
+ *
+ * Deltas are still AT-LEAST-ONCE overall, because a crash between writing the
+ * files and recording the run makes the next run redo the range. Apply them
+ * downstream as an UPSERT on entry_id, never as a blind INSERT.
  */
 class Exporter {
   constructor(opts = {}) {
@@ -50,7 +59,7 @@ class Exporter {
     this.compression = opts.compression ?? 'GZIP';
     this.mode = opts.mode ?? 'auto'; // 'auto' | 'full' | 'delta'
     this.since = opts.since ?? null; // explicit watermark override
-    this.overlapSeconds = opts.overlapSeconds ?? 1;
+    this.lagSeconds = opts.lagSeconds ?? 1;
     this.dryRun = opts.dryRun ?? false;
     this.progressEvery = opts.progressEvery ?? 500_000;
     this.stopRequested = false;
@@ -78,18 +87,27 @@ class Exporter {
       };
     }
     if (this.mode === 'delta' || this.mode === 'auto') {
-      const lo = Math.max(0, state.watermark - this.overlapSeconds);
       return {
         kind: 'delta',
-        lo,
-        reason:
-          `resuming from watermark ${state.watermark} (${fmtTs(state.watermark)})` +
-          (this.overlapSeconds
-            ? `, rewound ${this.overlapSeconds}s for safe overlap`
-            : ''),
+        lo: state.watermark,
+        reason: `resuming from watermark ${state.watermark} (${fmtTs(
+          state.watermark
+        )})`,
       };
     }
     throw new Error(`Unknown export mode: ${this.mode}`);
+  }
+
+  /**
+   * The newest second eligible for export. Held `lagSeconds` behind the clock
+   * so a transaction that stamped that second has time to commit before we
+   * declare it done — see the class comment.
+   */
+  _upperBound(startedAt) {
+    return Math.min(
+      this.db.getMaxLastUpdated(),
+      startedAt - 1 - this.lagSeconds
+    );
   }
 
   /**
@@ -108,21 +126,48 @@ class Exporter {
     }
   }
 
-  async run() {
-    const built = this.db.ensureLastUpdatedIndex();
-    if (built) {
-      this.logger.info('Built idx_last_updated (one-time, first export only).');
+  /**
+   * Builds idx_last_updated if missing. This takes SQLite's write lock for as
+   * long as the build runs (minutes on a 12M-row table), which will stall —
+   * and, without a generous busy_timeout, kill — a concurrently running
+   * crawler. So it is announced loudly, and skipped entirely for --dry-run,
+   * which is documented as having no side effects.
+   */
+  _ensureIndex() {
+    if (this.db.hasLastUpdatedIndex()) return;
+
+    if (this.dryRun) {
+      this.logger.warn(
+        'idx_last_updated is missing. --dry-run will not build it (the build ' +
+          'takes SQLite\'s write lock); the scan below falls back to a full ' +
+          'table scan and the real run will build it.'
+      );
+      return;
     }
+
+    this.logger.info(
+      'Building idx_last_updated — one-time, and it holds SQLite\'s write ' +
+        'lock until it finishes (minutes on a large table). A crawler running ' +
+        'against this DB will block until it completes.'
+    );
+    const t0 = Date.now();
+    this.db.buildLastUpdatedIndex();
+    this.logger.info(
+      `Built idx_last_updated in ${((Date.now() - t0) / 1000).toFixed(1)}s.`
+    );
+  }
+
+  async run() {
+    this._ensureIndex();
 
     const startedAt = nowSec();
     this.db.beginRead();
 
     let writer = null;
+    let committed = false;
     try {
       const { kind, lo, reason } = this._resolveRange();
-      // Clamp to the last fully-elapsed second: rows can still be committed
-      // into the current one after our snapshot was taken.
-      const hi = Math.min(this.db.getMaxLastUpdated(), startedAt - 1);
+      const hi = this._upperBound(startedAt);
       this.logger.info(`Export mode: ${kind} — ${reason}`);
 
       if (hi <= lo) {
@@ -189,10 +234,14 @@ class Exporter {
       }
 
       const files = await writer.close();
-      writer = null;
       const finishedAt = nowSec();
 
       this.db.endRead();
+      // `writer` stays non-null until this succeeds. recordExport is what makes
+      // the run real — if it throws (SQLITE_BUSY behind a crawler write, disk
+      // full), the watermark does not move, so the files on disk belong to no
+      // recorded run and the next export would write the same range again.
+      // Leaving them would double-load the documented `managers_full_*` glob.
       this.db.recordExport({
         dataset: this.dataset,
         kind,
@@ -207,6 +256,8 @@ class Exporter {
         startedAt,
         finishedAt,
       });
+      committed = true;
+      writer = null;
 
       const bytes = files.reduce((a, f) => a + f.bytes, 0);
       const elapsed = Math.max(1, finishedAt - startedAt);
@@ -224,10 +275,13 @@ class Exporter {
 
       return { kind, rows, files, watermarkFrom: lo, watermarkTo: hi };
     } catch (e) {
-      // Discard partial output and leave the watermark where it was, so the
-      // next run cleanly redoes this range.
-      if (writer) {
-        this.logger.warn('Export failed — removing partial output.');
+      // Discard output and leave the watermark where it was, so the next run
+      // cleanly redoes this range. This deliberately also throws away parts
+      // that finished cleanly: an export is all-or-nothing, and half a run
+      // left on disk would be indistinguishable from a complete one to the
+      // `managers_full_*/part-*.parquet` glob consumers are told to use.
+      if (writer && !committed) {
+        this.logger.warn('Export failed — removing this run\'s output.');
         await writer.abort();
       }
       this.db.endRead();

@@ -54,10 +54,11 @@ Options:
   --compression <c>      GZIP | SNAPPY | UNCOMPRESSED (default: GZIP —
                          ~26 B/row vs 38 for SNAPPY on real data, at ~6%
                          lower write throughput)
-  --overlap-seconds <n>  Rewind the watermark by n seconds so a crawler write
-                         that straddles the boundary can't be missed
-                         (default: 1). Deltas are at-least-once — apply them
-                         downstream as an UPSERT on entry_id.
+  --lag-seconds <n>      Hold the newest n seconds back from export, giving a
+                         crawler transaction that stamped that second time to
+                         commit (default: 1). Apply deltas downstream as an
+                         UPSERT on entry_id — a crash between writing files
+                         and recording the run replays the range.
   --dry-run              Report what would be exported; write nothing and
                          leave the watermark untouched
   --status               Print watermark + recent export history, then exit
@@ -86,8 +87,27 @@ Examples:
 `);
 }
 
+// Plausible unix-second range: 2001-09-09 .. 2033-05-18. Anything all-digit
+// outside it is far more likely a mistake (a bare year, or a 13-digit
+// millisecond timestamp) than a real timestamp, and guessing silently turns
+// `--since 2026` into 1970 — which re-exports the entire table as a "delta".
+const MIN_PLAUSIBLE_SECONDS = 1_000_000_000;
+const MAX_PLAUSIBLE_SECONDS = 2_000_000_000;
+
 function parseSince(v) {
-  if (/^\d+$/.test(v)) return parseInt(v, 10);
+  if (/^\d+$/.test(v)) {
+    const n = parseInt(v, 10);
+    if (n >= MIN_PLAUSIBLE_SECONDS && n <= MAX_PLAUSIBLE_SECONDS) return n;
+    const hint =
+      n > MAX_PLAUSIBLE_SECONDS
+        ? ' (looks like milliseconds — divide by 1000)'
+        : ' (looks like a year — pass a full date, e.g. 2026-05-09)';
+    console.error(
+      `Invalid --since value: ${v}${hint}. Expected unix seconds in ` +
+        `[${MIN_PLAUSIBLE_SECONDS}, ${MAX_PLAUSIBLE_SECONDS}] or an ISO-8601 date.`
+    );
+    process.exit(2);
+  }
   const ms = Date.parse(v);
   if (Number.isNaN(ms)) {
     console.error(`Invalid --since value: ${v} (expected unix seconds or ISO-8601)`);
@@ -104,7 +124,7 @@ function parseArgs(argv) {
     since: null,
     rowsPerFile: 2_000_000,
     compression: 'GZIP',
-    overlapSeconds: 1,
+    lagSeconds: 1,
     dryRun: false,
     status: false,
     dataset: 'managers',
@@ -129,7 +149,7 @@ function parseArgs(argv) {
       case '--since':         opts.since = parseSince(next()); break;
       case '--rows-per-file': opts.rowsPerFile = parseInt(next(), 10); break;
       case '--compression':   opts.compression = next().toUpperCase(); break;
-      case '--overlap-seconds': opts.overlapSeconds = parseInt(next(), 10); break;
+      case '--lag-seconds':   opts.lagSeconds = parseInt(next(), 10); break;
       case '--dry-run':       opts.dryRun = true; break;
       case '--status':        opts.status = true; break;
       case '--dataset':       opts.dataset = next(); break;
@@ -157,14 +177,24 @@ function parseArgs(argv) {
     console.error('--rows-per-file must be a positive integer');
     process.exit(2);
   }
-  if (!Number.isInteger(opts.overlapSeconds) || opts.overlapSeconds < 0) {
-    console.error('--overlap-seconds must be a non-negative integer');
+  if (!Number.isInteger(opts.lagSeconds) || opts.lagSeconds < 0) {
+    console.error('--lag-seconds must be a non-negative integer');
+    process.exit(2);
+  }
+  // The dataset name becomes a path segment under --out-dir and is fed to a
+  // recursive rmSync on failure, so anything that could escape the output
+  // directory (`..`, a slash, a leading dash) is rejected outright.
+  if (!/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(opts.dataset)) {
+    console.error(
+      `Invalid --dataset: ${opts.dataset} ` +
+        '(letters, digits, underscore and hyphen only; must start alphanumeric)'
+    );
     process.exit(2);
   }
   return opts;
 }
 
-function printStatus(db, dataset) {
+function printStatus(db, dataset, lagSeconds) {
   const state = db.getExportState(dataset);
   console.log(`Export status — dataset "${dataset}"`);
   console.log('─────────────────────────────────');
@@ -176,7 +206,14 @@ function printStatus(db, dataset) {
   console.log(`Last run kind:  ${state.last_kind}`);
   console.log(`Last run at:    ${fmtTs(state.last_run_at)}`);
 
-  const pending = db.countInRange(state.watermark, db.getMaxLastUpdated());
+  // Must use the same bounds the next run would, or this number contradicts
+  // what actually happens when you run it.
+  const hi = Math.min(
+    db.getMaxLastUpdated(),
+    Math.floor(Date.now() / 1000) - 1 - lagSeconds
+  );
+  const pending =
+    hi > state.watermark ? db.countInRange(state.watermark, hi) : 0;
   console.log(`Pending rows:   ${pending.toLocaleString()}`);
   console.log('');
   console.log('Recent runs:');
@@ -203,7 +240,7 @@ async function main() {
 
   if (opts.status) {
     try {
-      printStatus(db, opts.dataset);
+      printStatus(db, opts.dataset, opts.lagSeconds);
     } finally {
       db.close();
     }
@@ -211,6 +248,12 @@ async function main() {
   }
 
   fs.mkdirSync(opts.outDir, { recursive: true });
+
+  // Two exports of the same dataset would pick the same timestamped base name
+  // and truncate each other's parquet, and both would race the watermark. An
+  // exclusive lock file is cheaper and more honest than trying to make the
+  // name collision check atomic.
+  const release = opts.dryRun ? () => {} : acquireLock(opts.outDir, opts.dataset);
 
   const logger = new Logger(opts.logFile);
   const exporter = new Exporter({
@@ -222,19 +265,34 @@ async function main() {
     compression: opts.compression,
     mode: opts.mode,
     since: opts.since,
-    overlapSeconds: opts.overlapSeconds,
+    lagSeconds: opts.lagSeconds,
     dryRun: opts.dryRun,
   });
 
   logger.info(
     `Export config: db=${opts.dbPath} outDir=${opts.outDir} ` +
       `mode=${opts.mode} rowsPerFile=${opts.rowsPerFile} ` +
-      `compression=${opts.compression} dataset=${opts.dataset}` +
+      `compression=${opts.compression} lagSeconds=${opts.lagSeconds} ` +
+      `dataset=${opts.dataset}` +
       (opts.dryRun ? ' [dry-run]' : '')
   );
 
+  // Registering a handler removes Node's default terminate-on-signal, so a
+  // second signal must force the exit — otherwise Ctrl-C is a no-op during
+  // the synchronous stretches (CREATE INDEX, the gzip flush in close()) where
+  // the event loop never turns and the handler cannot run at all.
+  let signalled = false;
   const shutdown = (sig) => {
-    logger.info(`Received ${sig}.`);
+    if (signalled) {
+      logger.warn(`Received ${sig} again — exiting now.`);
+      logger.warn(
+        'Partial parquet files may be left behind; the watermark is unchanged.'
+      );
+      release();
+      process.exit(130);
+    }
+    signalled = true;
+    logger.info(`Received ${sig}. Send it again to force an immediate exit.`);
     exporter.stop();
   };
   process.on('SIGINT', () => shutdown('SIGINT'));
@@ -247,8 +305,66 @@ async function main() {
     if (e.stack) logger.error(e.stack);
     process.exitCode = 1;
   } finally {
+    release();
     db.close();
     logger.close();
+  }
+}
+
+/**
+ * Exclusive, stale-tolerant lock for one (out-dir, dataset) pair.
+ * Returns a release function that is safe to call more than once.
+ */
+function acquireLock(outDir, dataset) {
+  const lockPath = path.join(outDir, `.${dataset}.export.lock`);
+  let fd;
+  try {
+    fd = fs.openSync(lockPath, 'wx');
+  } catch (e) {
+    if (e.code !== 'EEXIST') throw e;
+    const holder = readLockPid(lockPath);
+    if (holder !== null && isAlive(holder)) {
+      console.error(
+        `Another export of "${dataset}" is already running (pid ${holder}, ` +
+          `lock ${lockPath}). Refusing to run two at once.`
+      );
+      process.exit(1);
+    }
+    // Stale lock from a kill -9: reclaim it.
+    console.error(`Removing stale export lock ${lockPath}.`);
+    fs.rmSync(lockPath, { force: true });
+    fd = fs.openSync(lockPath, 'wx');
+  }
+  fs.writeSync(fd, String(process.pid));
+  fs.closeSync(fd);
+
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    try {
+      fs.rmSync(lockPath, { force: true });
+    } catch {
+      /* best effort */
+    }
+  };
+}
+
+function readLockPid(lockPath) {
+  try {
+    const pid = parseInt(fs.readFileSync(lockPath, 'utf8').trim(), 10);
+    return Number.isInteger(pid) && pid > 0 ? pid : null;
+  } catch {
+    return null;
+  }
+}
+
+function isAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return e.code === 'EPERM';
   }
 }
 
