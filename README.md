@@ -408,10 +408,25 @@ The "Parquet is 2.2x smaller" figure elsewhere in this README is against **uncom
 `bin/ship-exports.sh` runs an export and rsyncs the result. Point it at the consumer and put it in cron:
 
 ```bash
-# /etc/cron.d/fpl-export  — every 12 hours
-0 */12 * * *  root  SHIP_REMOTE=fpl@consumer:/srv/fpl/incoming \
-  /opt/fpl-crawler/bin/ship-exports.sh >> /opt/fpl-crawler/logs/ship.log 2>&1
+# crontab -e, every 12 hours
+PATH=/root/.nvm/versions/node/v20.20.2/bin:/usr/local/bin:/usr/bin:/bin
+
+0 */12 * * * cd /root/fpl-teams-bot && { bin/ship-exports.sh >> logs/ship.log 2>&1 || echo "fpl ship-exports FAILED - see logs/ship.log"; }
 ```
+
+Two things about that entry are load-bearing:
+
+- **The `cd`.** Cron starts in `$HOME`, so a relative script path resolves against the wrong directory and the run dies before it does anything.
+- **The pinned `PATH`.** If Node came from nvm it is *not* on cron's default `PATH`, and a system `/usr/bin/node` — often a different major version — wins instead. `better-sqlite3` is a native module, so which Node runs it is not a detail to leave to chance. Check with `command -v node` and `/usr/bin/node --version`, and pin to the one you tested against.
+
+Verify the entry by running it the way cron will, rather than the way your shell would:
+
+```bash
+cd /root && env -i PATH=<pinned> HOME=/root SHELL=/bin/sh \
+  /bin/sh -c 'cd /root/fpl-teams-bot && EXPORT_ARGS=--dry-run bin/ship-exports.sh'
+```
+
+Failures land in `logs/ship.log` with a non-zero exit, and the `|| echo` puts a line on cron's stdout so an MTA would mail it — but if no MTA is configured, **nothing alerts anyone**. Point a healthcheck at the log or ping a monitoring endpoint if the freshness matters.
 
 **Baseline the consumer first.** The full-vs-delta decision is made from the watermark in SQLite, which knows nothing about what the *other* server has. If exports have already been run locally the watermark is already advanced, so the next run is a delta containing only recent changes — the consumer would start life missing every manager who hasn't changed since. Ship one full snapshot before the first cron tick:
 

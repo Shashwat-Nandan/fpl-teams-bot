@@ -29,6 +29,9 @@
 #
 # CONFIGURATION (environment, or a .env beside this script's repo root)
 #   SHIP_REMOTE       user@host:/path/to/landing/dir      (required)
+#                     Quote it in .env if the path starts with `~`: bash
+#                     expands a tilde following a colon using the LOCAL home,
+#                     so host:~/data silently becomes host:/root/data.
 #   SHIP_SSH_KEY      path to the private key             (default: ssh's own)
 #   SHIP_SSH_PORT     ssh port                            (default: 22)
 #   EXPORT_FORMAT     csv | parquet                       (default: csv)
