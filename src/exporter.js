@@ -1,8 +1,32 @@
 'use strict';
 
 const fs = require('fs');
+const crypto = require('crypto');
 const path = require('path');
 const { PartitionedParquetWriter, toParquetRow } = require('./parquet');
+const { PartitionedCsvWriter, toCsvRow } = require('./csv');
+const { SEASON } = require('./season');
+
+/**
+ * Output formats. Parquet stays the default, but the size argument for it is
+ * weaker than it looks: measured on 300k real rows, gzipped CSV is 20.3 B/row
+ * against parquet's 19.6 — a 3.4% difference. (The 2.2x figure quoted
+ * elsewhere is against *uncompressed* CSV, at 63.9 B/row.) So if the consumer
+ * is Postgres, CSV is usually the better handoff: `COPY` reads it natively,
+ * with no extension or loader to install.
+ */
+const FORMATS = {
+  parquet: {
+    ext: '.parquet',
+    Writer: PartitionedParquetWriter,
+    toRow: toParquetRow,
+  },
+  csv: {
+    ext: (compression) => (compression === 'GZIP' ? '.csv.gz' : '.csv'),
+    Writer: PartitionedCsvWriter,
+    toRow: toCsvRow,
+  },
+};
 
 /**
  * Exports the `managers` table to parquet, full the first time and
@@ -57,6 +81,13 @@ class Exporter {
     this.outDir = opts.outDir;
     this.rowsPerFile = opts.rowsPerFile ?? 2_000_000;
     this.compression = opts.compression ?? 'GZIP';
+    this.format = opts.format ?? 'parquet';
+    if (!FORMATS[this.format]) {
+      throw new Error(
+        `Unknown export format: ${this.format} ` +
+          `(expected ${Object.keys(FORMATS).join(', ')})`
+      );
+    }
     this.mode = opts.mode ?? 'auto'; // 'auto' | 'full' | 'delta'
     this.since = opts.since ?? null; // explicit watermark override
     this.lagSeconds = opts.lagSeconds ?? 1;
@@ -110,20 +141,76 @@ class Exporter {
     );
   }
 
+  /** The file extension this run's format writes. */
+  get _ext() {
+    const { ext } = FORMATS[this.format];
+    return typeof ext === 'function' ? ext(this.compression) : ext;
+  }
+
   /**
    * Names are stamped to the second, so two exports inside the same second
    * would otherwise silently overwrite each other. Suffix on collision.
    */
   _uniqueBaseName(kind, startedAt) {
     const base = `${this.dataset}_${kind}_${tsStamp(startedAt)}`;
+    const ext = this._ext;
     const taken = (name) =>
       fs.existsSync(path.join(this.outDir, name)) ||
-      fs.existsSync(path.join(this.outDir, `${name}.parquet`));
+      fs.existsSync(path.join(this.outDir, `${name}${ext}`)) ||
+      fs.existsSync(path.join(this.outDir, `${name}${MANIFEST_EXT}`));
     if (!taken(base)) return base;
     for (let n = 1; ; n++) {
       const candidate = `${base}-${n}`;
       if (!taken(candidate)) return candidate;
     }
+  }
+
+  /**
+   * Writes the manifest that a downstream consumer reads.
+   *
+   * This is the delivery contract, and it is written *last*, after every data
+   * file is closed. A shipper syncs data files before manifests, so a
+   * manifest's presence on the far side means every file it names is there in
+   * full. Consumers key off `watermark_to`: apply manifests in ascending order
+   * and skip ones already applied, and re-delivery of the same run becomes a
+   * no-op rather than a double-load.
+   */
+  _writeManifest({
+    baseName,
+    kind,
+    lo,
+    hi,
+    rows,
+    files,
+    startedAt,
+    finishedAt,
+  }) {
+    const manifestPath = path.join(this.outDir, `${baseName}${MANIFEST_EXT}`);
+    const manifest = {
+      dataset: this.dataset,
+      season: SEASON,
+      kind,
+      format: this.format,
+      compression: this.compression,
+      columns: ['entry_id', 'player_name', 'team_name', 'rank', 'last_updated'],
+      watermark_from: lo,
+      watermark_from_iso: fmtTs(lo),
+      watermark_to: hi,
+      watermark_to_iso: fmtTs(hi),
+      rows,
+      started_at: startedAt,
+      finished_at: finishedAt,
+      // Paths are relative to the export root so they still resolve after the
+      // directory has been rsynced somewhere else.
+      files: files.map((f) => ({
+        name: path.relative(this.outDir, f.path).split(path.sep).join('/'),
+        rows: f.rows,
+        bytes: f.bytes,
+        sha256: sha256File(f.path),
+      })),
+    };
+    fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + '\n');
+    return manifestPath;
   }
 
   /**
@@ -139,14 +226,14 @@ class Exporter {
     if (this.dryRun) {
       this.logger.warn(
         'idx_last_updated is missing. --dry-run will not build it (the build ' +
-          'takes SQLite\'s write lock); the scan below falls back to a full ' +
+          "takes SQLite's write lock); the scan below falls back to a full " +
           'table scan and the real run will build it.'
       );
       return;
     }
 
     this.logger.info(
-      'Building idx_last_updated — one-time, and it holds SQLite\'s write ' +
+      "Building idx_last_updated — one-time, and it holds SQLite's write " +
         'lock until it finishes (minutes on a large table). A crawler running ' +
         'against this DB will block until it completes.'
     );
@@ -190,11 +277,19 @@ class Exporter {
             'Watermark NOT advanced.'
         );
         this.db.endRead();
-        return { kind, rows: count, files: [], watermarkFrom: lo, watermarkTo: hi, dryRun: true };
+        return {
+          kind,
+          rows: count,
+          files: [],
+          watermarkFrom: lo,
+          watermarkTo: hi,
+          dryRun: true,
+        };
       }
 
       const baseName = this._uniqueBaseName(kind, startedAt);
-      writer = new PartitionedParquetWriter({
+      const fmt = FORMATS[this.format];
+      writer = new fmt.Writer({
         baseDir: this.outDir,
         baseName,
         rowsPerFile: this.rowsPerFile,
@@ -215,7 +310,7 @@ class Exporter {
       const iter = this.db.iterateRange(lo, hi);
       try {
         for (const r of iter) {
-          await writer.appendRow(toParquetRow(r));
+          await writer.appendRow(fmt.toRow(r));
           rows++;
           if (rows % this.progressEvery === 0) {
             const elapsed = (Date.now() - t0) / 1000;
@@ -235,6 +330,21 @@ class Exporter {
 
       const files = await writer.close();
       const finishedAt = nowSec();
+
+      // Written before recordExport so a failure to record still discards it
+      // along with the data — a manifest naming a run that never happened
+      // would be loaded downstream and then silently re-exported later.
+      const manifestPath = this._writeManifest({
+        baseName,
+        kind,
+        lo,
+        hi,
+        rows,
+        files,
+        startedAt,
+        finishedAt,
+      });
+      writer.track(manifestPath);
 
       this.db.endRead();
       // `writer` stays non-null until this succeeds. recordExport is what makes
@@ -263,8 +373,8 @@ class Exporter {
       const elapsed = Math.max(1, finishedAt - startedAt);
       this.logger.info(
         `${kind} export complete: ${rows.toLocaleString()} rows in ` +
-          `${files.length} file(s), ${fmtBytes(bytes)}, ${elapsed}s. ` +
-          `Watermark advanced to ${hi} (${fmtTs(hi)}).`
+          `${files.length} ${this.format} file(s), ${fmtBytes(bytes)}, ` +
+          `${elapsed}s. Watermark advanced to ${hi} (${fmtTs(hi)}).`
       );
       for (const f of files) {
         this.logger.info(
@@ -272,8 +382,16 @@ class Exporter {
             `${f.rows.toLocaleString()} rows  ${fmtBytes(f.bytes)}`
         );
       }
+      this.logger.info(`  ${path.relative(process.cwd(), manifestPath)}`);
 
-      return { kind, rows, files, watermarkFrom: lo, watermarkTo: hi };
+      return {
+        kind,
+        rows,
+        files,
+        manifest: manifestPath,
+        watermarkFrom: lo,
+        watermarkTo: hi,
+      };
     } catch (e) {
       // Discard output and leave the watermark where it was, so the next run
       // cleanly redoes this range. This deliberately also throws away parts
@@ -281,7 +399,7 @@ class Exporter {
       // left on disk would be indistinguishable from a complete one to the
       // `managers_full_*/part-*.parquet` glob consumers are told to use.
       if (writer && !committed) {
-        this.logger.warn('Export failed — removing this run\'s output.');
+        this.logger.warn("Export failed — removing this run's output.");
         await writer.abort();
       }
       this.db.endRead();
@@ -297,6 +415,28 @@ class Exporter {
         'watermark left unchanged.'
     );
   }
+}
+
+const MANIFEST_EXT = '.manifest.json';
+
+/**
+ * Hashes in fixed-size chunks rather than reading the file whole — part files
+ * are only bounded by --rows-per-file, and slurping a multi-GB one to
+ * checksum it would be a silly way to run out of memory.
+ */
+function sha256File(filePath) {
+  const hash = crypto.createHash('sha256');
+  const buf = Buffer.allocUnsafe(1 << 20);
+  const fd = fs.openSync(filePath, 'r');
+  try {
+    let bytes;
+    while ((bytes = fs.readSync(fd, buf, 0, buf.length, null)) > 0) {
+      hash.update(buf.subarray(0, bytes));
+    }
+  } finally {
+    fs.closeSync(fd);
+  }
+  return hash.digest('hex');
 }
 
 function nowSec() {

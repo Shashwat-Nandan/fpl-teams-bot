@@ -370,6 +370,100 @@ ON CONFLICT (entry_id) DO UPDATE SET
 
 Because every row carries its own `last_updated`, deltas can be replayed in any order and re-applied safely.
 
+### CSV, if you'd rather not add a Parquet reader
+
+`--format csv` writes the same columns with a header row, so a bare `COPY` loads it — no DuckDB, no `pg_parquet`:
+
+```bash
+node src/export.js --format csv                        # .csv.gz (default)
+node src/export.js --format csv --compression UNCOMPRESSED   # plain .csv
+```
+
+```sql
+CREATE TEMP TABLE staging (LIKE fpl_managers);
+\copy staging FROM PROGRAM 'zcat managers_delta_20260807T020000Z.csv.gz' WITH (FORMAT csv, HEADER true)
+
+INSERT INTO fpl_managers SELECT * FROM staging
+ON CONFLICT (entry_id) DO UPDATE SET
+  player_name  = EXCLUDED.player_name,
+  team_name    = EXCLUDED.team_name,
+  rank         = EXCLUDED.rank,
+  last_updated = EXCLUDED.last_updated;
+```
+
+Text columns are **always** quoted and `rank` is written as an unquoted empty field when null. That is deliberate: under `FORMAT csv` Postgres reads an unquoted empty field as NULL and `""` as the empty string, so this is what keeps a null rank from being loaded as `0` or failing the integer cast. Every part file carries its own header, so parts can be loaded independently and in any order.
+
+**Gzipped CSV costs almost nothing over Parquet.** Measured on the same 300,000 real rows:
+
+| format | size | bytes/row |
+| --- | --- | --- |
+| `.parquet` (GZIP) | 5.61 MB | 19.6 |
+| `.csv.gz` | 5.80 MB | 20.3 |
+| `.csv` plain | 18.28 MB | 63.9 |
+
+The "Parquet is 2.2x smaller" figure elsewhere in this README is against **uncompressed** CSV — that is the 536 MB number. Against `.csv.gz` the gap is **3.4%**, so if the consumer is Postgres, take the CSV: `COPY` is built in and you give up nothing meaningful in transfer size. Parquet remains the better choice if you query the files in place rather than loading them.
+
+## Shipping to another server
+
+`bin/ship-exports.sh` runs an export and rsyncs the result. Point it at the consumer and put it in cron:
+
+```bash
+# /etc/cron.d/fpl-export  — every 12 hours
+0 */12 * * *  root  SHIP_REMOTE=fpl@consumer:/srv/fpl/incoming \
+  /opt/fpl-crawler/bin/ship-exports.sh >> /opt/fpl-crawler/logs/ship.log 2>&1
+```
+
+**Baseline the consumer first.** The full-vs-delta decision is made from the watermark in SQLite, which knows nothing about what the *other* server has. If exports have already been run locally the watermark is already advanced, so the next run is a delta containing only recent changes — the consumer would start life missing every manager who hasn't changed since. Ship one full snapshot before the first cron tick:
+
+```bash
+SHIP_REMOTE=fpl@consumer:/srv/fpl/incoming EXPORT_ARGS=--full bin/ship-exports.sh
+```
+
+Check where you stand with `npm run export-status` before deciding.
+
+Configuration comes from the environment, or a `.env` at the repo root:
+
+| variable | default | |
+| --- | --- | --- |
+| `SHIP_REMOTE` | *(required)* | `user@host:/path` |
+| `SHIP_SSH_KEY` | ssh's own default | private key path |
+| `SHIP_SSH_PORT` | `22` | |
+| `EXPORT_FORMAT` | `csv` | `csv` or `parquet` |
+| `EXPORT_ARGS` | *(empty)* | extra `src/export.js` args |
+| `RETAIN_DAYS` | `30` | delete local exports older than this; `0` keeps forever |
+
+### Why it syncs instead of moving
+
+**Do not write `export && scp file remote: && rm file`.** The export watermark advances as soon as a file is written *locally*, so if that copy fails the next export starts from the advanced watermark and those rows are never revisited. Nothing downstream would notice — those managers would just be missing until someone ran `--full`.
+
+So the export directory is append-only local state and the whole thing is rsynced every tick. rsync skips what is already there, so re-syncing is nearly free, and a transfer that failed last tick is simply retried this tick. **Delivery can fail as often as it likes without corrupting the producer's bookkeeping.** `RETAIN_DAYS` pruning is only safe because of this: anything old enough to prune has been offered to the remote on every run since it was written.
+
+### The manifest is the contract
+
+Each run writes `<base>.manifest.json` **after** every data file is closed:
+
+```json
+{
+  "dataset": "managers", "season": "2026-27",
+  "kind": "delta", "format": "csv", "compression": "GZIP",
+  "watermark_from": 1786000000, "watermark_to": 1786043200,
+  "rows": 1832,
+  "files": [{ "name": "managers_delta_20260807T020000Z.csv.gz",
+              "rows": 1832, "bytes": 41203, "sha256": "…" }]
+}
+```
+
+The shipper syncs data files first and manifests second, in two passes, so **a manifest's presence on the far side means every file it names is there in full** — and rsync renames into place only on completion, so a file visible under its final name is never partial. A run that fails to commit deletes its manifest along with its data, so the consumer never sees a manifest for a run the producer has disowned.
+
+For the consumer, that makes the load loop:
+
+1. list manifests not yet applied, ordered by `watermark_from`;
+2. verify `sha256` for each file (catches a truncated transfer);
+3. `COPY` into staging, `UPSERT` on `entry_id`;
+4. record `watermark_to` as applied.
+
+`watermark_from` of each run equals `watermark_to` of the previous one, so a gap in that chain is a loud signal that something was skipped. Re-delivering a run is a no-op because step 4 makes it idempotent — which matters, since deltas are **at-least-once**: a crash between writing files and recording the run makes the producer redo the range under a new name.
+
 Search API query shape:
 
 ```sql
@@ -411,8 +505,12 @@ src/
   season.js     Season constant + per-season DB path
   db.js         SQLite schema + prepared statements
   logger.js     Timestamped logger
-  export.js     Parquet export CLI (full first, incremental after)
-  exporter.js   Watermark resolution + streaming export loop
-  parquet.js    Parquet schema + partitioned/rolling writer
+  export.js     Export CLI (full first, incremental after)
+  exporter.js   Watermark resolution + streaming export loop + manifest
+  partition.js  Rollover / promotion / abort shared by every format
+  parquet.js    Parquet schema + writer
+  csv.js        CSV writer (RFC 4180 quoting, optional gzip)
   stats.js      Progress stats
+bin/
+  ship-exports.sh  Cron entry point: export, then rsync to the consumer
 ```

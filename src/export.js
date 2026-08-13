@@ -2,16 +2,21 @@
 'use strict';
 
 /**
- * Export the managers table to Parquet — full on the first run, incremental
- * (only changed/new managers) on every run after that.
+ * Export the managers table to Parquet or CSV — full on the first run,
+ * incremental (only changed/new managers) on every run after that.
  *
  * Usage:
  *   node src/export.js [options]
  *
  * Layout under --out-dir (default ./data/parquet):
  *   managers_full_20260806T091600Z/part-0000.parquet, part-0001.parquet, …
+ *   managers_full_20260806T091600Z.manifest.json
  *   managers_delta_20260807T020000Z.parquet
- *   managers_delta_20260808T020000Z.parquet
+ *   managers_delta_20260807T020000Z.manifest.json
+ *
+ * Every run also writes a manifest listing its files with row counts, byte
+ * sizes and sha256s, written last so its presence means the run is complete.
+ * See bin/ship-exports.sh for how that is used to move data to another host.
  *
  * Postgres / Supabase import (via DuckDB):
  *   CREATE TABLE fpl_managers (
@@ -33,12 +38,17 @@ const Logger = require('./logger');
 const Exporter = require('./exporter');
 const { fmtBytes, fmtTs } = require('./exporter');
 const { CODECS } = require('./parquet');
+const { CSV_CODECS } = require('./csv');
+
+const FORMATS = ['parquet', 'csv'];
+// Parquet supports SNAPPY; CSV is just gzip-or-not.
+const CODECS_FOR = { parquet: CODECS, csv: CSV_CODECS };
 
 function printHelp() {
   console.log(`
-FPL Parquet Exporter
+FPL Exporter (Parquet or CSV)
 
-Exports {entry_id, player_name, team_name, rank, last_updated} to Parquet.
+Exports {entry_id, player_name, team_name, rank, last_updated} to Parquet or CSV.
 The first run writes a full snapshot; every run after that writes only the
 managers whose name or team name changed since the previous export.
 
@@ -51,10 +61,13 @@ Options:
   --delta                Force an incremental export (fails-safe to full if
                          no previous export exists)
   --since <ts>           Override the watermark. Unix seconds or ISO-8601.
-  --rows-per-file <n>    Rows per parquet part file (default: 2000000)
-  --compression <c>      GZIP | SNAPPY | UNCOMPRESSED (default: GZIP —
+  --format <f>           parquet | csv (default: parquet). csv loads with a
+                         bare Postgres COPY and, gzipped, is only ~3% larger.
+  --rows-per-file <n>    Rows per part file (default: 2000000)
+  --compression <c>      parquet: GZIP | SNAPPY | UNCOMPRESSED (default: GZIP —
                          ~26 B/row vs 38 for SNAPPY on real data, at ~6%
                          lower write throughput)
+                         csv: GZIP (.csv.gz) | UNCOMPRESSED (.csv)
   --lag-seconds <n>      Hold the newest n seconds back from export, giving a
                          crawler transaction that stamped that second time to
                          commit (default: 1). Apply deltas downstream as an
@@ -111,7 +124,9 @@ function parseSince(v) {
   }
   const ms = Date.parse(v);
   if (Number.isNaN(ms)) {
-    console.error(`Invalid --since value: ${v} (expected unix seconds or ISO-8601)`);
+    console.error(
+      `Invalid --since value: ${v} (expected unix seconds or ISO-8601)`
+    );
     process.exit(2);
   }
   return Math.floor(ms / 1000);
@@ -123,6 +138,7 @@ function parseArgs(argv) {
     dbPath: defaultDbPath(),
     mode: 'auto',
     since: null,
+    format: 'parquet',
     rowsPerFile: 2_000_000,
     compression: 'GZIP',
     lagSeconds: 1,
@@ -148,6 +164,7 @@ function parseArgs(argv) {
       case '--full':          opts.mode = 'full'; break;
       case '--delta':         opts.mode = 'delta'; break;
       case '--since':         opts.since = parseSince(next()); break;
+      case '--format':        opts.format = next().toLowerCase(); break;
       case '--rows-per-file': opts.rowsPerFile = parseInt(next(), 10); break;
       case '--compression':   opts.compression = next().toUpperCase(); break;
       case '--lag-seconds':   opts.lagSeconds = parseInt(next(), 10); break;
@@ -168,9 +185,17 @@ function parseArgs(argv) {
     }
   }
 
-  if (!CODECS.includes(opts.compression)) {
+  if (!FORMATS.includes(opts.format)) {
     console.error(
-      `Invalid --compression: ${opts.compression} (expected one of ${CODECS.join(', ')})`
+      `Invalid --format: ${opts.format} (expected one of ${FORMATS.join(', ')})`
+    );
+    process.exit(2);
+  }
+  const allowed = CODECS_FOR[opts.format];
+  if (!allowed.includes(opts.compression)) {
+    console.error(
+      `Invalid --compression for --format ${opts.format}: ${opts.compression} ` +
+        `(expected one of ${allowed.join(', ')})`
     );
     process.exit(2);
   }
@@ -254,7 +279,9 @@ async function main() {
   // and truncate each other's parquet, and both would race the watermark. An
   // exclusive lock file is cheaper and more honest than trying to make the
   // name collision check atomic.
-  const release = opts.dryRun ? () => {} : acquireLock(opts.outDir, opts.dataset);
+  const release = opts.dryRun
+    ? () => {}
+    : acquireLock(opts.outDir, opts.dataset);
 
   const logger = new Logger(opts.logFile);
   const exporter = new Exporter({
@@ -262,6 +289,7 @@ async function main() {
     logger,
     dataset: opts.dataset,
     outDir: opts.outDir,
+    format: opts.format,
     rowsPerFile: opts.rowsPerFile,
     compression: opts.compression,
     mode: opts.mode,
@@ -272,7 +300,8 @@ async function main() {
 
   logger.info(
     `Export config: db=${opts.dbPath} outDir=${opts.outDir} ` +
-      `mode=${opts.mode} rowsPerFile=${opts.rowsPerFile} ` +
+      `format=${opts.format} mode=${opts.mode} ` +
+      `rowsPerFile=${opts.rowsPerFile} ` +
       `compression=${opts.compression} lagSeconds=${opts.lagSeconds} ` +
       `dataset=${opts.dataset}` +
       (opts.dryRun ? ' [dry-run]' : '')

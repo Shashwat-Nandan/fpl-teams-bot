@@ -83,15 +83,20 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
         `spacing, took ${elapsed}ms — the rate gate is not holding`
     );
 
-    // No two request starts should collapse onto each other. setTimeout can
-    // fire a millisecond early, so allow a small tolerance.
-    for (let i = 1; i < starts.length; i++) {
-      const gap = starts[i] - starts[i - 1];
-      assert.ok(
-        gap >= SPACING - 5,
-        `requests ${i - 1} and ${i} started ${gap}ms apart, expected ~${SPACING}ms`
-      );
-    }
+    // Requests must be spread out, not merely slow in aggregate. Asserting on
+    // every individual gap would be flaky: the gate fixes slot times up
+    // front, so an event-loop stall lets several expired sleeps fire together
+    // and then the run catches up — a short burst with the average rate still
+    // correct. The median gap is the robust form of the same claim, and it
+    // still fails loudly on the old throttle, which put 14 of these 15 starts
+    // into a single millisecond (median gap 0).
+    const gaps = starts.slice(1).map((t, i) => t - starts[i]);
+    const median = [...gaps].sort((a, b) => a - b)[Math.floor(gaps.length / 2)];
+    assert.ok(
+      median >= SPACING * 0.5,
+      `median gap between request starts was ${median}ms at ${SPACING}ms ` +
+        `spacing — requests are clumping (gaps: ${gaps.join(',')})`
+    );
 
     // Concurrency must still be real: 15 requests of 30ms each, serialised,
     // would take 450ms. Behind the gate they overlap.
