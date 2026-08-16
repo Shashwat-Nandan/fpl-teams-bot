@@ -411,22 +411,28 @@ The "Parquet is 2.2x smaller" figure elsewhere in this README is against **uncom
 # crontab -e, every 12 hours
 PATH=/root/.nvm/versions/node/v20.20.2/bin:/usr/local/bin:/usr/bin:/bin
 
-0 */12 * * * cd /root/fpl-teams-bot && { bin/ship-exports.sh >> logs/ship.log 2>&1 || echo "fpl ship-exports FAILED - see logs/ship.log"; }
+0 */12 * * * { /root/fpl-teams-bot/bin/ship-exports.sh >> /root/fpl-teams-bot/logs/ship.log 2>&1 || echo "fpl ship-exports FAILED - see /root/fpl-teams-bot/logs/ship.log"; }
 ```
 
 Two things about that entry are load-bearing:
 
-- **The `cd`.** Cron starts in `$HOME`, so a relative script path resolves against the wrong directory and the run dies before it does anything.
+- **Every path is absolute.** Cron starts in `$HOME`, not the repo. A relative entry fails *silently and completely*: the script cannot be found, and the redirect cannot create the log either, so there is no trace in the place you would look. The first version of this entry was relative and shipped nothing for three days. The script `cd`s to its own repo root, so an absolute invocation needs no `cd` — which is one less thing to get wrong than `cd … && …`.
 - **The pinned `PATH`.** If Node came from nvm it is *not* on cron's default `PATH`, and a system `/usr/bin/node` — often a different major version — wins instead. `better-sqlite3` is a native module, so which Node runs it is not a detail to leave to chance. Check with `command -v node` and `/usr/bin/node --version`, and pin to the one you tested against.
 
-Verify the entry by running it the way cron will, rather than the way your shell would:
+Verify by extracting the command **from the installed crontab** and running that, in a cron-like environment, from `$HOME`. Retyping the line you meant to install tests your typing, not your crontab:
 
 ```bash
-cd /root && env -i PATH=<pinned> HOME=/root SHELL=/bin/sh \
-  /bin/sh -c 'cd /root/fpl-teams-bot && EXPORT_ARGS=--dry-run bin/ship-exports.sh'
+CMD="$(crontab -l | grep '^0 \*/12' | sed -E 's/^([^ ]+ +){5}//')"
+CRON_PATH="$(crontab -l | grep '^PATH=' | cut -d= -f2-)"
+cd /root && printf '%s\n' "$CMD" > /tmp/cron-cmd.sh &&
+  env -i PATH="$CRON_PATH" HOME=/root SHELL=/bin/sh /bin/sh /tmp/cron-cmd.sh
 ```
 
-Failures land in `logs/ship.log` with a non-zero exit, and the `|| echo` puts a line on cron's stdout so an MTA would mail it — but if no MTA is configured, **nothing alerts anyone**. Point a healthcheck at the log or ping a monitoring endpoint if the freshness matters.
+Then confirm it actually appended to `logs/ship.log`. `journalctl -u cron | grep ship-exports` shows what cron really ran, which is the other place to check when a schedule appears to do nothing.
+
+**Cron uses local time, not UTC.** `0 */12` on a `Europe/Berlin` box fires at 22:00 and 10:00 UTC.
+
+Failures land in `logs/ship.log` with a non-zero exit, and the `|| echo` puts a line on cron's stdout so an MTA would mail it — but with no MTA cron just logs `(CRON) info (No MTA installed, discarding output)` and **nothing alerts anyone**. Point a healthcheck at the log or ping a monitoring endpoint if freshness matters. A missed run costs nothing on its own — the watermark only advances on success, so the next run picks up everything — but only if you notice before someone starts trusting stale data.
 
 **Baseline the consumer first.** The full-vs-delta decision is made from the watermark in SQLite, which knows nothing about what the *other* server has. If exports have already been run locally the watermark is already advanced, so the next run is a delta containing only recent changes — the consumer would start life missing every manager who hasn't changed since. Ship one full snapshot before the first cron tick:
 
