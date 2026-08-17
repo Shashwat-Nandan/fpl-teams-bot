@@ -18,6 +18,14 @@
  *   - Every ID must still be probed exactly once, with no gaps or repeats
  *     across batch boundaries.
  *   - --max-ids must remain an exact ceiling, not "give or take a batch".
+ *
+ * The sweep also has to survive the network being imperfect. A 4xx is a
+ * verdict about an entry and is recorded as dead; anything else is a statement
+ * about the network and is deferred, leaving the ID a gap for a later run.
+ * Rethrowing instead used to abort the whole sweep — two entries that hit 503
+ * on 2026-05-09 killed a run that had already probed hundreds of thousands of
+ * IDs. Only *consecutive* failures, meaning the endpoint has stopped answering
+ * altogether, should stop a run.
  */
 
 const assert = require('assert');
@@ -256,18 +264,23 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     fs.rmSync(tmp, { recursive: true, force: true });
   }
 
-  // ---------- 5. a fatal error aborts the run and propagates ----------
+  // ---------- 5. scattered failures are deferred, not fatal ----------
   {
     const tmp = mkTmp();
     const db = new FPLDatabase(path.join(tmp, 'c.db'));
-    let issued = 0;
+    const TOTAL = 300;
+    // Every 10th ID is unreachable — spread out, so no run of them is ever
+    // consecutive. Two such IDs killed an entire real sweep on 2026-05-09.
+    const unreachable = new Set(
+      Array.from({ length: TOTAL }, (_, i) => i + 1).filter(
+        (id) => id % 10 === 0
+      )
+    );
     const fetcher = {
       fetchJson: async (url) => {
-        if (url.includes('bootstrap-static')) return { total_players: 500 };
-        issued++;
+        if (url.includes('bootstrap-static')) return { total_players: TOTAL };
         const id = parseInt(url.match(/entry\/(\d+)/)[1], 10);
-        await sleep(2);
-        if (id === 20) throw new Error('Max retries exceeded');
+        if (unreachable.has(id)) throw new Error('Max retries exceeded');
         return {
           id,
           player_first_name: 'P',
@@ -278,21 +291,124 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
       },
     };
 
+    const r = await new Backfiller({
+      db,
+      fetcher,
+      logger: QUIET,
+      concurrency: 8,
+      batchSize: 40,
+    }).run();
+
+    assert.strictEqual(r.failed, 30, 'every 10th ID should be deferred');
+    assert.strictEqual(r.found, 270, 'the other 270 must still be collected');
+    assert.strictEqual(
+      db.count(),
+      270,
+      'a scattering of failures must not stop the sweep'
+    );
+    // Deferred IDs are NOT dead. Marking them would permanently skip a real
+    // manager over one bad minute, and no later run would ever retry them.
+    assert.strictEqual(
+      db.db.prepare('SELECT COUNT(*) c FROM dead_entries').get().c,
+      0,
+      'an unreachable ID must never be recorded as dead'
+    );
+
+    // Because a gap is defined by absence, the retry needs no extra state:
+    // the next run simply finds them missing again.
+    unreachable.clear();
+    const retry = await new Backfiller({
+      db,
+      fetcher,
+      logger: QUIET,
+      concurrency: 8,
+    }).run();
+    assert.strictEqual(
+      retry.found,
+      30,
+      'the next run retries what was deferred'
+    );
+    assert.strictEqual(
+      db.count(),
+      TOTAL,
+      'no ID is lost to a transient failure'
+    );
+
+    db.close();
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+
+  // ---------- 5b. a sustained outage does stop the run ----------
+  {
+    const tmp = mkTmp();
+    const db = new FPLDatabase(path.join(tmp, 'c2.db'));
+    let issued = 0;
+    const fetcher = {
+      fetchJson: async (url) => {
+        if (url.includes('bootstrap-static')) return { total_players: 5000 };
+        issued++;
+        throw new Error('connect ECONNREFUSED');
+      },
+    };
+
     await assert.rejects(
       () =>
         new Backfiller({
           db,
           fetcher,
           logger: QUIET,
-          concurrency: 8,
-          batchSize: 50,
+          concurrency: 4,
+          batchSize: 500,
+          maxConsecutiveFailures: 10,
         }).run(),
-      /Max retries exceeded/,
-      'an unrecoverable error must surface, not be swallowed by the pool'
+      /consecutive failures/,
+      'an endpoint answering nothing must stop the run, not be retried forever'
     );
+    // concurrency workers may be mid-flight when the threshold trips, so allow
+    // a small overshoot — but it must be bounded, not thousands.
     assert.ok(
-      issued < 500,
-      `the run should have stopped early, but issued ${issued} requests`
+      issued < 10 + 4 * 2,
+      `should have stopped near the threshold, issued ${issued}`
+    );
+    db.close();
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+
+  // ---------- 5c. the counter measures CONSECUTIVE failures ----------
+  {
+    const tmp = mkTmp();
+    const db = new FPLDatabase(path.join(tmp, 'c3.db'));
+    const TOTAL = 200;
+    const fetcher = {
+      fetchJson: async (url) => {
+        if (url.includes('bootstrap-static')) return { total_players: TOTAL };
+        const id = parseInt(url.match(/entry\/(\d+)/)[1], 10);
+        // Long runs of failures, but always broken by a success before the
+        // threshold. A counter that never reset would abort here.
+        if (id % 10 !== 0) throw new Error('Max retries exceeded');
+        return {
+          id,
+          player_first_name: 'P',
+          player_last_name: String(id),
+          name: `T${id}`,
+          summary_overall_rank: null,
+        };
+      },
+    };
+
+    const r = await new Backfiller({
+      db,
+      fetcher,
+      logger: QUIET,
+      concurrency: 1, // serial, so "consecutive" is unambiguous
+      maxConsecutiveFailures: 12,
+    }).run();
+
+    assert.strictEqual(r.found, 20, 'the reachable IDs are still collected');
+    assert.strictEqual(
+      r.failed,
+      180,
+      'a success must reset the counter, or 9-in-a-row would trip a 12 threshold'
     );
     db.close();
     fs.rmSync(tmp, { recursive: true, force: true });
@@ -370,7 +486,11 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   console.log('   - Concurrent sweep covers 1..N exactly once: ✓');
   console.log('   - In-flight requests stay within --concurrency: ✓');
   console.log('   - --max-ids is an exact ceiling: ✓');
-  console.log('   - Fatal errors propagate; stop() resumes cleanly: ✓');
+  console.log('   - Scattered failures are deferred, never fatal: ✓');
+  console.log('   - Deferred IDs stay gaps, retried by the next run: ✓');
+  console.log('   - A sustained outage does stop the run: ✓');
+  console.log('   - A success resets the consecutive-failure counter: ✓');
+  console.log('   - stop() resumes cleanly: ✓');
 })().catch((e) => {
   console.error('\n❌ Throughput test failed:', e);
   process.exit(1);

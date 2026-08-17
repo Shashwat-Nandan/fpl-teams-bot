@@ -136,6 +136,31 @@ The league crawler scans pages of standings sorted by rank. When ranks shift mid
 
 It has two jobs now: filling post-crawl gaps, and acting as the **only** collection method before GW1, when standings don't exist.
 
+### Keeping it running
+
+Three things used to stop the sweep and leave it stopped.
+
+**A handful of failures killed the whole run.** Any error that wasn't a 4xx and outlived the fetcher's retries was rethrown and aborted everything — on 2026-05-09 two entries hit 503 and took down a run that had already probed hundreds of thousands of IDs. Now the two cases are treated differently, because they mean different things:
+
+| response | meaning | action |
+| --- | --- | --- |
+| 4xx | a verdict about *that entry* — it does not exist | record in `dead_entries`, never ask again |
+| 5xx / timeout / reset | a statement about *the network* | defer: log, count, move on |
+
+A deferred ID is deliberately **not** marked dead — that would permanently skip a real manager over one bad minute. It stays a gap, and since a gap is defined by absence, the next run retries it with no extra bookkeeping.
+
+A run still stops when failures are *consecutive* (`--max-consecutive-failures`, default 25), which is what separates a flaky request from an endpoint that has stopped answering. Any success resets the counter.
+
+**Nothing re-ran it.** The sweep exits as soon as the gap is empty, which is right — but registrations arrive continuously until the GW1 deadline, so a sweep that ran once left the directory drifting further behind every hour. It is now hourly:
+
+```bash
+20 * * * * { /root/fpl-teams-bot/bin/sweep-entries.sh >> /root/fpl-teams-bot/logs/sweep-cron.log 2>&1 || echo "fpl sweep-entries FAILED"; }
+```
+
+With nothing to do that costs one `bootstrap-static` request plus a ~1s gap count, so running it often is close to free. `bin/sweep-entries.sh` exists rather than a bare `node src/backfill.js` because the CLI derives its default database and log paths from `process.cwd()`, and cron starts in `$HOME`.
+
+**Two sweeps could overlap.** A full sweep can run for hours; an hourly timer would have started a second one on top of it, probing every gap twice and doubling the request rate. `src/backfill.js` now takes an O_EXCL lock next to the database (shared with the exporter via `src/lock.js`) and exits **0** — not an error — when a sweep is already running, since on an hourly timer that is the expected case, not a fault.
+
 ```bash
 # Smoke test: probe 5 missing IDs.
 npm run backfill-test
@@ -158,6 +183,8 @@ CLI options mirror the crawler's where they overlap:
 --max-ids <n>         Max IDs to probe in this run (default: unlimited)
 --rate <n>            Target requests per second (default: 100)
 --concurrency <n>     Requests in flight at once (default: 16)
+--max-consecutive-failures <n>
+                      Stop after this many unreachable IDs in a row (25)
 --delay-ms <n>        Min delay between requests in ms. Overrides --rate.
 --jitter-ms <n>       Max additional random jitter in ms
 --max-retries <n>     Max retries per request (default: 5)
@@ -534,7 +561,9 @@ src/
   partition.js  Rollover / promotion / abort shared by every format
   parquet.js    Parquet schema + writer
   csv.js        CSV writer (RFC 4180 quoting, optional gzip)
+  lock.js       O_EXCL single-instance lock (exporter + backfiller)
   stats.js      Progress stats
 bin/
   ship-exports.sh  Cron entry point: export, then rsync to the consumer
+  sweep-entries.sh Cron entry point: probe entry IDs not yet stored
 ```

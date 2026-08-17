@@ -7,6 +7,7 @@ const FPLDatabase = require('./db');
 const Fetcher = require('./fetcher');
 const Logger = require('./logger');
 const Backfiller = require('./backfiller');
+const { acquireLock } = require('./lock');
 
 function printHelp() {
   console.log(`
@@ -26,6 +27,10 @@ Options:
                         starts returning 429s above ~150/s.
   --concurrency <n>     Requests in flight at once (default: 16). Hides network
                         latency; the rate above is what bounds throughput.
+  --max-consecutive-failures <n>
+                        Stop the run after this many unreachable IDs in a row
+                        with no success between (default: 25). Isolated
+                        failures are deferred to a later run, never fatal.
   --delay-ms <n>        Min delay between requests in ms. Overrides --rate.
   --jitter-ms <n>       Max additional random jitter in ms
   --max-retries <n>     Max retries per request (default: 5)
@@ -66,6 +71,7 @@ function parseArgs(argv) {
     maxIds: Infinity,
     ...spacingForRate(DEFAULT_RATE),
     concurrency: 16,
+    maxConsecutiveFailures: 25,
     maxRetries: 5,
     dbPath: defaultDbPath(),
     logFile: path.join(process.cwd(), 'logs', 'backfill.log'),
@@ -90,6 +96,8 @@ function parseArgs(argv) {
       case '--max-ids':      opts.maxIds = parseInt(next(), 10); break;
       case '--rate':         rate = parseFloat(next()); break;
       case '--concurrency':  opts.concurrency = parseInt(next(), 10); break;
+      case '--max-consecutive-failures':
+        opts.maxConsecutiveFailures = parseInt(next(), 10); break;
       case '--delay-ms':     explicit.minDelayMs = parseInt(next(), 10); break;
       case '--jitter-ms':    explicit.maxJitterMs = parseInt(next(), 10); break;
       case '--max-retries':  opts.maxRetries = parseInt(next(), 10); break;
@@ -128,6 +136,18 @@ function parseArgs(argv) {
 
 async function main() {
   const opts = parseArgs(process.argv);
+
+  // One sweep per database. Without this, an hourly timer firing while a
+  // multi-hour sweep is still running would probe every gap twice and double
+  // the request rate straight into the 429s measured above ~150/s.
+  const release = acquireLock(
+    path.join(
+      path.dirname(opts.dbPath),
+      `.${path.basename(opts.dbPath)}.backfill.lock`
+    ),
+    { label: 'backfill', busyExitCode: 0 }
+  );
+
   const logger = new Logger(opts.logFile);
   const db = new FPLDatabase(opts.dbPath);
   const fetcher = new Fetcher({
@@ -141,6 +161,7 @@ async function main() {
     upperBound: opts.upperBound,
     maxIds: opts.maxIds,
     concurrency: opts.concurrency,
+    maxConsecutiveFailures: opts.maxConsecutiveFailures,
     db,
     fetcher,
     logger,
@@ -168,6 +189,7 @@ async function main() {
     if (e.stack) logger.error(e.stack);
     process.exitCode = 1;
   } finally {
+    release();
     db.close();
     logger.close();
   }

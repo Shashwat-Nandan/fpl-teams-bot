@@ -32,6 +32,8 @@ class Backfiller {
     this.checkpointLogEvery = opts.checkpointLogEvery ?? 100;
     this.batchSize = opts.batchSize ?? 5000;
     this.concurrency = Math.max(1, opts.concurrency ?? 1);
+    this.maxConsecutiveFailures = opts.maxConsecutiveFailures ?? 25;
+    this._consecutiveFailures = 0;
     this.db = opts.db;
     this.fetcher = opts.fetcher;
     this.logger = opts.logger;
@@ -86,7 +88,7 @@ class Backfiller {
         'No upper bound: bootstrap-static was unreachable and the managers ' +
           'table is empty. Pass --upper-bound <n> to sweep explicitly.'
       );
-      return { probed: 0, found: 0, dead: 0 };
+      return { probed: 0, found: 0, dead: 0, failed: 0 };
     }
 
     const estimated = this.db.countMissingEntryIds(upper);
@@ -94,10 +96,10 @@ class Backfiller {
       `Sweeping [1, ${upper.toLocaleString()}] — ` +
         `~${estimated.toLocaleString()} IDs not yet stored.`
     );
-    if (estimated === 0) return { probed: 0, found: 0, dead: 0 };
+    if (estimated === 0) return { probed: 0, found: 0, dead: 0, failed: 0 };
 
     const limit = Math.min(estimated, this.maxIds);
-    const stats = { probed: 0, found: 0, dead: 0 };
+    const stats = { probed: 0, found: 0, dead: 0, failed: 0 };
     const startedAt = Date.now();
     let fatal = null;
     // Counted when a worker takes an ID, not when it finishes, so `limit` is
@@ -151,7 +153,8 @@ class Backfiller {
     const total = this.db.count();
     this.logger.info(
       `Backfill run finished. Probed: ${stats.probed}. Found: ${stats.found}. ` +
-        `Dead (404 etc.): ${stats.dead}. Duration: ${duration.toFixed(1)}s. ` +
+        `Dead (404 etc.): ${stats.dead}. Deferred (unreachable): ` +
+        `${stats.failed}. Duration: ${duration.toFixed(1)}s. ` +
         `DB total: ${total}.`
     );
     if (fatal) throw fatal;
@@ -159,8 +162,24 @@ class Backfiller {
   }
 
   /**
-   * Probe one entry ID and record the outcome. Throws only on errors that
-   * should abort the whole run; 404s and other 4xx are recorded as dead.
+   * Probe one entry ID and record the outcome.
+   *
+   * A 4xx is a verdict about that entry: it does not exist, so record it dead
+   * and never ask again. Anything else — a 5xx that outlived its retries, a
+   * timeout, a reset connection — is a statement about the network, not about
+   * the entry. Those are *deferred*: logged, counted, and left alone. Because
+   * a gap is defined by absence, an ID we could not reach is still a gap, so
+   * the next run picks it up with no extra bookkeeping. It must NOT be marked
+   * dead, which would permanently skip a manager over one bad minute.
+   *
+   * This used to rethrow, aborting the entire sweep. Two entries that hit 503
+   * on 2026-05-09 killed a run that had already probed hundreds of thousands
+   * of IDs. Deferring instead means a scattering of failures costs a
+   * scattering of IDs.
+   *
+   * Throws only when failures are *consecutive*, which is what distinguishes
+   * a flaky request from an endpoint that has stopped answering. Continuing to
+   * hammer an API that is failing everything would be both useless and rude.
    */
   async _probeOne(id, stats, limit, startedAt) {
     let data;
@@ -174,15 +193,34 @@ class Backfiller {
           );
         }
         this.db.markDead(id, e.status);
+        this._consecutiveFailures = 0;
         stats.dead++;
         stats.probed++;
         this._maybeLog(stats, limit, startedAt);
         return;
       }
-      this.logger.error(`Fatal error on entry ${id}: ${e.message}`);
-      throw e;
+
+      this._consecutiveFailures++;
+      stats.failed++;
+      stats.probed++;
+      this.logger.warn(
+        `entry ${id}: ${e.message} — deferring to a later run ` +
+          `(${this._consecutiveFailures} in a row)`
+      );
+      if (this._consecutiveFailures >= this.maxConsecutiveFailures) {
+        throw new Error(
+          `${this._consecutiveFailures} consecutive failures with no success ` +
+            `in between (most recently entry ${id}: ${e.message}). The API ` +
+            'looks unavailable rather than flaky, so this run is stopping. ' +
+            'Nothing is lost — unreached IDs are still gaps and the next run ' +
+            'will retry them.'
+        );
+      }
+      this._maybeLog(stats, limit, startedAt);
+      return;
     }
 
+    this._consecutiveFailures = 0;
     try {
       this.db.upsertFromEntry(data);
       stats.found++;
@@ -194,7 +232,7 @@ class Backfiller {
   }
 
   _maybeLog(stats, limit, startedAt) {
-    const { probed, found, dead } = stats;
+    const { probed, found, dead, failed } = stats;
     if (probed % this.checkpointLogEvery !== 0 && probed !== limit) return;
     const elapsed = (Date.now() - startedAt) / 1000;
     const rate = elapsed > 0 ? probed / elapsed : 0;
@@ -203,8 +241,9 @@ class Backfiller {
     const throttled = this.fetcher?.rateLimitHits
       ? ` 429s: ${this.fetcher.rateLimitHits}.`
       : '';
+    const deferred = failed ? `, deferred=${failed}` : '';
     this.logger.info(
-      `Probed ${probed}/${limit} (found=${found}, dead=${dead}). ` +
+      `Probed ${probed}/${limit} (found=${found}, dead=${dead}${deferred}). ` +
         `Rate: ${rate.toFixed(2)}/s. ETA: ${etaH.toFixed(1)}h.${throttled}`
     );
   }

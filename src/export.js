@@ -39,6 +39,7 @@ const Exporter = require('./exporter');
 const { fmtBytes, fmtTs } = require('./exporter');
 const { CODECS } = require('./parquet');
 const { CSV_CODECS } = require('./csv');
+const { acquireLock } = require('./lock');
 
 const FORMATS = ['parquet', 'csv'];
 // Parquet supports SNAPPY; CSV is just gzip-or-not.
@@ -159,20 +160,48 @@ function parseArgs(argv) {
       return v;
     };
     switch (a) {
-      case '--out-dir':       opts.outDir = path.resolve(next()); break;
-      case '--db':            opts.dbPath = next(); break;
-      case '--full':          opts.mode = 'full'; break;
-      case '--delta':         opts.mode = 'delta'; break;
-      case '--since':         opts.since = parseSince(next()); break;
-      case '--format':        opts.format = next().toLowerCase(); break;
-      case '--rows-per-file': opts.rowsPerFile = parseInt(next(), 10); break;
-      case '--compression':   opts.compression = next().toUpperCase(); break;
-      case '--lag-seconds':   opts.lagSeconds = parseInt(next(), 10); break;
-      case '--dry-run':       opts.dryRun = true; break;
-      case '--status':        opts.status = true; break;
-      case '--dataset':       opts.dataset = next(); break;
-      case '--log':           opts.logFile = next(); break;
-      case '--no-log-file':   opts.logFile = null; break;
+      case '--out-dir':
+        opts.outDir = path.resolve(next());
+        break;
+      case '--db':
+        opts.dbPath = next();
+        break;
+      case '--full':
+        opts.mode = 'full';
+        break;
+      case '--delta':
+        opts.mode = 'delta';
+        break;
+      case '--since':
+        opts.since = parseSince(next());
+        break;
+      case '--format':
+        opts.format = next().toLowerCase();
+        break;
+      case '--rows-per-file':
+        opts.rowsPerFile = parseInt(next(), 10);
+        break;
+      case '--compression':
+        opts.compression = next().toUpperCase();
+        break;
+      case '--lag-seconds':
+        opts.lagSeconds = parseInt(next(), 10);
+        break;
+      case '--dry-run':
+        opts.dryRun = true;
+        break;
+      case '--status':
+        opts.status = true;
+        break;
+      case '--dataset':
+        opts.dataset = next();
+        break;
+      case '--log':
+        opts.logFile = next();
+        break;
+      case '--no-log-file':
+        opts.logFile = null;
+        break;
       case '-h':
       case '--help':
         printHelp();
@@ -281,7 +310,9 @@ async function main() {
   // name collision check atomic.
   const release = opts.dryRun
     ? () => {}
-    : acquireLock(opts.outDir, opts.dataset);
+    : acquireLock(path.join(opts.outDir, `.${opts.dataset}.export.lock`), {
+        label: `export of "${opts.dataset}"`,
+      });
 
   const logger = new Logger(opts.logFile);
   const exporter = new Exporter({
@@ -338,63 +369,6 @@ async function main() {
     release();
     db.close();
     logger.close();
-  }
-}
-
-/**
- * Exclusive, stale-tolerant lock for one (out-dir, dataset) pair.
- * Returns a release function that is safe to call more than once.
- */
-function acquireLock(outDir, dataset) {
-  const lockPath = path.join(outDir, `.${dataset}.export.lock`);
-  let fd;
-  try {
-    fd = fs.openSync(lockPath, 'wx');
-  } catch (e) {
-    if (e.code !== 'EEXIST') throw e;
-    const holder = readLockPid(lockPath);
-    if (holder !== null && isAlive(holder)) {
-      console.error(
-        `Another export of "${dataset}" is already running (pid ${holder}, ` +
-          `lock ${lockPath}). Refusing to run two at once.`
-      );
-      process.exit(1);
-    }
-    // Stale lock from a kill -9: reclaim it.
-    console.error(`Removing stale export lock ${lockPath}.`);
-    fs.rmSync(lockPath, { force: true });
-    fd = fs.openSync(lockPath, 'wx');
-  }
-  fs.writeSync(fd, String(process.pid));
-  fs.closeSync(fd);
-
-  let released = false;
-  return () => {
-    if (released) return;
-    released = true;
-    try {
-      fs.rmSync(lockPath, { force: true });
-    } catch {
-      /* best effort */
-    }
-  };
-}
-
-function readLockPid(lockPath) {
-  try {
-    const pid = parseInt(fs.readFileSync(lockPath, 'utf8').trim(), 10);
-    return Number.isInteger(pid) && pid > 0 ? pid : null;
-  } catch {
-    return null;
-  }
-}
-
-function isAlive(pid) {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (e) {
-    return e.code === 'EPERM';
   }
 }
 
