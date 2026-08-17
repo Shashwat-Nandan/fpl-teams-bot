@@ -411,13 +411,14 @@ The "Parquet is 2.2x smaller" figure elsewhere in this README is against **uncom
 # crontab -e, every 12 hours
 PATH=/root/.nvm/versions/node/v20.20.2/bin:/usr/local/bin:/usr/bin:/bin
 
-0 */12 * * * { /root/fpl-teams-bot/bin/ship-exports.sh >> /root/fpl-teams-bot/logs/ship.log 2>&1 || echo "fpl ship-exports FAILED - see /root/fpl-teams-bot/logs/ship.log"; }
+45 11,23 * * * { /root/fpl-teams-bot/bin/ship-exports.sh >> /root/fpl-teams-bot/logs/ship.log 2>&1 || echo "fpl ship-exports FAILED - see /root/fpl-teams-bot/logs/ship.log"; }
 ```
 
-Two things about that entry are load-bearing:
+Three things about that entry are load-bearing:
 
 - **Every path is absolute.** Cron starts in `$HOME`, not the repo. A relative entry fails *silently and completely*: the script cannot be found, and the redirect cannot create the log either, so there is no trace in the place you would look. The first version of this entry was relative and shipped nothing for three days. The script `cd`s to its own repo root, so an absolute invocation needs no `cd` — which is one less thing to get wrong than `cd … && …`.
 - **The pinned `PATH`.** If Node came from nvm it is *not* on cron's default `PATH`, and a system `/usr/bin/node` — often a different major version — wins instead. `better-sqlite3` is a native module, so which Node runs it is not a detail to leave to chance. Check with `command -v node` and `/usr/bin/node --version`, and pin to the one you tested against.
+- **The 11:45/23:45 offset.** The consumer runs its own ingest on a 12-hour timer at 00:00/12:00. When both sides fired at the same minute, the consumer — which finishes in ~11s against this shipper's ~60s — ran *just before* each delta landed, logged `No pending deltas — nothing to do`, and pinged its healthcheck green while the data sat unread for another 12 hours. Producer and consumer schedules must not collide, and the producer must go first with room to spare. Size the gap against a full re-baseline (~2 min), not a typical delta.
 
 Verify by extracting the command **from the installed crontab** and running that, in a cron-like environment, from `$HOME`. Retyping the line you meant to install tests your typing, not your crontab:
 
@@ -430,7 +431,9 @@ cd /root && printf '%s\n' "$CMD" > /tmp/cron-cmd.sh &&
 
 Then confirm it actually appended to `logs/ship.log`. `journalctl -u cron | grep ship-exports` shows what cron really ran, which is the other place to check when a schedule appears to do nothing.
 
-**Cron uses local time, not UTC.** `0 */12` on a `Europe/Berlin` box fires at 22:00 and 10:00 UTC.
+**Cron uses local time, not UTC.** `45 11,23` on a `Europe/Berlin` box fires at 09:45 and 21:45 UTC. Check both ends are reasoning in the same timezone before concluding two schedules are offset — a `systemd` `OnCalendar=` is local too, so the two agree here, but that is worth confirming rather than assuming.
+
+A green healthcheck on the consumer means *its* job ran, not that it had anything to read. If freshness matters, alert on the consumer's watermark falling behind the producer's, not on either job's exit status — the collision above produced two healthy-looking jobs and a pipeline that was 12 hours stale by construction.
 
 Failures land in `logs/ship.log` with a non-zero exit, and the `|| echo` puts a line on cron's stdout so an MTA would mail it — but with no MTA cron just logs `(CRON) info (No MTA installed, discarding output)` and **nothing alerts anyone**. Point a healthcheck at the log or ping a monitoring endpoint if freshness matters. A missed run costs nothing on its own — the watermark only advances on success, so the next run picks up everything — but only if you notice before someone starts trusting stale data.
 
